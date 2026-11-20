@@ -1,19 +1,11 @@
 import Groq from "groq-sdk";
-import type { ZodType } from "zod";
-import {
-  AuditJSON,
-  AuditZ,
-  BatchJSON,
-  BatchOutZ,
-  RubricJSON,
-  RubricZ,
-  type Audit,
-  type Rubric,
-} from "./schemas";
+import type { ZodType, ZodTypeDef } from "zod";
+import { AuditJSON, AuditLLMZ, BatchJSON, BatchOutZ, RubricJSON, RubricZ, type Audit, type Rubric } from "./schemas";
+import { buildCriteria, computeScore, ctcString, fitOf, type Criterion, type Facts } from "./scoring";
 import { tierFor } from "./tier";
 
 export const MODELS = {
-  rubric: "openai/gpt-oss-120b", // deep requirement extraction
+  rubric: "openai/gpt-oss-120b", // deep requirement extraction + critic pass
   batch: "openai/gpt-oss-20b", // ~1000 tok/s real-time scoring
   deep: "openai/gpt-oss-120b", // single-profile audit
 } as const;
@@ -21,36 +13,27 @@ export const MODELS = {
 let _client: Groq | null = null;
 function client(): Groq {
   if (!process.env.GROQ_API_KEY) throw new Error("GROQ_API_KEY is not set on the server");
-  return (_client ??= new Groq({ apiKey: process.env.GROQ_API_KEY, maxRetries: 2 }));
+  return (_client ??= new Groq({ apiKey: process.env.GROQ_API_KEY.trim(), maxRetries: 2 }));
 }
 
 /* ─────────────── Shared Indian-recruitment prompt rules ─────────────── */
 
 const INDIA_RULES = `
-You are a senior Indian technical recruiter's assistant. Apply Indian hiring conventions:
+You are a meticulous senior Indian technical recruiter's assistant. Apply Indian hiring conventions:
 
-SKILL MATCHING (semantic, not keyword):
-- Treat skill equivalence/implication as a match: Next.js/Gatsby/Remix ⇒ React; React Native ⇒ React; TypeScript ⇒ JavaScript;
+SKILL MATCHING (semantic, evidence-based — not keyword counting):
+- Equivalence/implication counts as evidence: Next.js/Gatsby/Remix ⇒ React; React Native ⇒ React; TypeScript ⇒ JavaScript;
   Spring Boot ⇒ Java + Spring; Django/Flask/FastAPI ⇒ Python; Express/NestJS ⇒ Node.js; EKS/AKS/GKE ⇒ Kubernetes;
   PySpark ⇒ Spark + Python; Redshift/BigQuery/Snowflake ⇒ cloud data warehouse; MERN ⇒ MongoDB+Express+React+Node.
-- Accept common abbreviations/spellings (JS, TS, K8s, GCP, AWS, ReactJS = React, Node = Node.js, Postgres = PostgreSQL).
-- Only credit a skill if the candidate text provides evidence for it. Never invent skills. Do not penalise for absent nice-to-haves heavily.
+- Accept abbreviations/spellings (JS, TS, K8s, GCP, AWS, ReactJS = React, Node = Node.js, Postgres = PostgreSQL).
+- Credit a skill only when the candidate text supports it (skills list, job description, projects, designation). Never invent skills.
+- Judge SENIORITY of use: "led/architected/owned" > "worked on". Years-of-skill requirements must be compared to the evidence given.
 
 NOTICE PERIOD (India): "Immediate"/"Serving notice"/"Available now" = 0 days; "15 Days"; "1 Month"=30; "2 Months"=60; "3 Months"=90.
-Lower is better. If the JD sets a max notice period, anything above it is a risk; 60–90 days is common and often negotiable/buy-out-able for strong candidates.
-If absent in the text, report "Not mentioned" with noticeDays = -1.
-
-COMPENSATION: Figures are in LPA (lakhs per annum, INR). "12.5 Lacs" = 12.5 LPA; "1 Cr" = 100 LPA; monthly figures ×12.
-Compare current/expected CTC against the JD budget; expected CTC above budget by >15% is a risk. If CTC is hidden, report "Not disclosed" and do not guess.
-
-EXPERIENCE: Compare total experience to the JD min/max range. Slightly outside the range is a soft penalty; far outside is a heavy one.
-Weigh relevant experience over total years, and recency of the relevant stack.
-LOCATION: Match candidate location/relocation willingness against JD location & remote policy (e.g. Bengaluru vs Bangalore are the same).
-
-SCORING (integer 0–100): ~50% must-have skills coverage (with equivalence), ~20% experience fit, ~10% nice-to-haves & domain, ~20% notice period + CTC + location fit.
-Calibrate: 85+ = strong across all must-haves; 60–79 = solid with a gap or soft mismatch; <45 = weak or missing core must-haves.
-Resdex text may be abbreviated, truncated or have masked contact info — judge only what is present and never fabricate.
-Output must follow the supplied JSON schema exactly. Use -1 for unknown numbers and "" (or "Not mentioned") for unknown strings.
+COMPENSATION: LPA (lakhs per annum, INR). "12.5 Lacs" = 12.5 LPA; "1 Cr" = 100 LPA; monthly figures ×12.
+EXPERIENCE: total years (e.g. "6 Yrs 3 Months" = 6.25). LOCATION: Bengaluru = Bangalore; NCR includes Gurgaon/Gurugram/Noida/Delhi.
+Resdex text may be abbreviated, truncated or have masked contact info — report only what is present; never fabricate.
+Use -1 for unknown numbers and "" (or "Not mentioned") for unknown strings. Output must follow the supplied JSON schema exactly.
 `.trim();
 
 /* ─────────────── Structured-output call ─────────────── */
@@ -61,7 +44,7 @@ interface StructuredArgs<T> {
   system: string;
   user: string;
   jsonSchema: Record<string, unknown>;
-  zod: ZodType<T>;
+  zod: ZodType<T, ZodTypeDef, unknown>;
   maxTokens: number;
   effort: "low" | "medium" | "high";
 }
@@ -79,10 +62,7 @@ async function structured<T>(a: StructuredArgs<T>): Promise<T> {
           { role: "system", content: a.system },
           { role: "user", content: a.user },
         ],
-        response_format: {
-          type: "json_schema",
-          json_schema: { name: a.name, strict: true, schema: a.jsonSchema },
-        },
+        response_format: { type: "json_schema", json_schema: { name: a.name, strict: true, schema: a.jsonSchema } },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -98,38 +78,117 @@ async function structured<T>(a: StructuredArgs<T>): Promise<T> {
   throw lastErr instanceof Error ? lastErr : new Error("Groq call failed");
 }
 
-/* ─────────────── 1. JD rubric extraction (120B) ─────────────── */
+/* ─────────────── 1. JD rubric extraction: extract → critique/refine (120B) ─────────────── */
+
+const RUBRIC_SPEC = `
+Fields:
+- title, department ("" if unclear), seniority.
+- mustHaveSkills: HARD requirements — anything labelled must/required/mandatory/"should have", and every unqualified item in a Requirements/Qualifications list. Canonical short names (max 12).
+- importantSkills: strongly preferred, or core to the stated responsibilities but not labelled mandatory (max 8).
+- niceToHaveSkills: "good to have / preferred / bonus / plus" only (max 8). A skill appears in exactly ONE of the three lists.
+- skillMinYears: only where the JD ties years to a specific skill ("3+ years of React" → {skill:"React", years:3}).
+- skillAliases: for each must/important skill, 2–5 equivalents/implied terms a candidate profile might use instead (e.g. React → Next.js, ReactJS, React Native).
+- min/maxExperienceYears (overall; max=-1 if open-ended), maxNoticePeriodDays ("immediate joiners"=0; -1 if not stated), ctcBudgetMin/MaxLpa (convert to LPA).
+- education + educationRequired (true only if the JD insists on a degree), certifications, industries (domains the person should have worked in), companyTypes ("product", "startup", "MNC", "SaaS", "service"…).
+- responsibilities: up to 5 key things the person must actually have DONE (verb phrases, e.g. "Designed event-driven microservices at scale").
+- dealBreakers: explicit exclusions or hard negatives in the JD ("no freshers", "not from pure service companies", "no job-hoppers <1 yr"). Empty if none stated — do NOT invent.
+- locations (normalised city names), remotePolicy, domainContext (1–2 sentences).
+- targetTitles: 4–6 alternate designations a matching candidate may currently hold (incl. adjacent seniority).
+- searchVariants: EXACTLY 3 plain-text Resdex keyword strings, NO Boolean operators/quotes/parentheses, each ≤ 6 words:
+    "Precise"  = best-fit title + the 2 scarcest must-have skills (small, very relevant pool)
+    "Balanced" = the 4–5 highest-signal must-have skills (+ title word if useful)
+    "Wide"     = alternate title/synonym + 1–2 key skills (large pool for recall)
+  Prefer terms that appear on real profiles; skip ubiquitous skills (Git, Agile, MS Office) and soft skills.
+- coreKeywords: 3–5 short single keywords/titles (same spirit, no operators).
+Use -1 for any unstated number, "" for unstated strings, [] for unstated lists.`.trim();
 
 export async function extractRubric(rawJd: string): Promise<Rubric> {
-  const r = await structured({
+  const jd = rawJd.slice(0, 20000);
+
+  // Pass 1 — thorough extraction
+  const draft = await structured({
     model: MODELS.rubric,
     name: "jd_rubric",
     jsonSchema: RubricJSON,
     zod: RubricZ,
-    maxTokens: 3000,
-    effort: "medium",
-    system: `${INDIA_RULES}
-
-TASK: Convert the job description into a structured evaluation rubric.
-- title: the role title; department: team/function (e.g. "Engineering", "Data") or "" if unclear.
-- mustHaveSkills: hard requirements (max 12, canonical short names, e.g. "React", "Node.js", "PostgreSQL"). Collapse implied skills into the broader one when sensible.
-- niceToHaveSkills: preferred / bonus items (max 10).
-- min/maxExperienceYears: from phrases like "5-8 years", "5+ years" (max = -1 if open-ended). -1 if absent.
-- maxNoticePeriodDays: e.g. "immediate joiners" = 0, "up to 30 days" = 30; -1 if not stated.
-- ctcBudgetMin/MaxLpa: convert to LPA; -1 if not stated.
-- locations: cities (normalised, e.g. "Bengaluru"); remotePolicy: onsite|hybrid|remote|flexible|unspecified.
-- domainContext: one or two sentences on the business/domain (e.g. "B2B fintech payments platform, high-scale transaction systems").
-- coreKeywords: 3–5 SHORT plain keywords/titles a recruiter would type in Naukri Resdex's keyword box (NO boolean operators, no quotes, no AND/OR).`,
-    user: `JOB DESCRIPTION:\n"""\n${rawJd.slice(0, 20000)}\n"""`,
+    maxTokens: 5000,
+    effort: "high",
+    system: `${INDIA_RULES}\n\nTASK: Read EVERY sentence of the job description and convert it into a precise evaluation rubric. Nothing in the JD should be lost, and nothing should be invented.\n${RUBRIC_SPEC}`,
+    user: `JOB DESCRIPTION:\n"""\n${jd}\n"""`,
   });
+
+  // Pass 2 — independent critic: find omissions / wrong priorities, return the corrected rubric.
+  let final = draft;
+  try {
+    final = await structured({
+      model: MODELS.rubric,
+      name: "jd_rubric_refined",
+      jsonSchema: RubricJSON,
+      zod: RubricZ,
+      maxTokens: 5000,
+      effort: "medium",
+      system: `${INDIA_RULES}\n\nTASK: You are a strict reviewer of a draft rubric extracted from a JD. Re-read the JD line by line and fix the draft:
+1. Any requirement, tool, responsibility, qualification, number (years/CTC/notice) or location in the JD that is missing → add it.
+2. Wrong priority (e.g. a mandatory item listed as nice-to-have, or vice-versa) → move it. A skill must be in only one list.
+3. Skills that are only implied by the responsibilities → importantSkills.
+4. Invented or unsupported items → remove. Tighten duplicate/overlapping items.
+5. Verify the 3 search variants are plain keywords, high-signal and genuinely different in breadth.
+Return the FULL corrected rubric.\n${RUBRIC_SPEC}`,
+      user: `JOB DESCRIPTION:\n"""\n${jd}\n"""\n\nDRAFT RUBRIC:\n${JSON.stringify(draft)}`,
+    });
+  } catch {
+    /* keep the draft if the refine pass fails/rate-limits */
+  }
+  return normalizeRubric(final);
+}
+
+const BOOL_CHARS = /\b(AND|OR|NOT)\b|[()"]/g;
+const cleanKw = (s: string) => s.replace(BOOL_CHARS, " ").replace(/\s+/g, " ").trim();
+function dedupe(a: string[], max = 50) {
+  const seen = new Set<string>();
+  return a
+    .map((s) => s.trim())
+    .filter((s) => s && !seen.has(s.toLowerCase()) && seen.add(s.toLowerCase()))
+    .slice(0, max);
+}
+
+function normalizeRubric(r: Rubric): Rubric {
+  const must = dedupe(r.mustHaveSkills, 12);
+  const taken = new Set(must.map((s) => s.toLowerCase()));
+  const important = dedupe(r.importantSkills, 8).filter((s) => !taken.has(s.toLowerCase()));
+  important.forEach((s) => taken.add(s.toLowerCase()));
+  const nice = dedupe(r.niceToHaveSkills, 8).filter((s) => !taken.has(s.toLowerCase()));
+  const variants = r.searchVariants
+    .map((v) => ({ label: v.label.trim() || "Search", keywords: cleanKw(v.keywords) }))
+    .filter((v) => v.keywords)
+    .slice(0, 3);
+  const core = dedupe(r.coreKeywords.map(cleanKw).filter(Boolean), 5);
   return {
     ...r,
-    department: r.department ?? "",
-    mustHaveSkills: dedupe(r.mustHaveSkills).slice(0, 12),
-    niceToHaveSkills: dedupe(r.niceToHaveSkills).slice(0, 10),
-    coreKeywords: dedupe(r.coreKeywords.map((k) => k.replace(/\b(AND|OR|NOT)\b|[()"]/g, " ").replace(/\s+/g, " ").trim()).filter(Boolean)).slice(0, 5),
+    mustHaveSkills: must,
+    importantSkills: important,
+    niceToHaveSkills: nice,
+    skillMinYears: r.skillMinYears.filter((x) => x.skill && x.years > 0),
+    skillAliases: r.skillAliases.filter((x) => x.skill && x.aliases.length).map((x) => ({ skill: x.skill, aliases: dedupe(x.aliases, 6) })),
+    certifications: dedupe(r.certifications, 4),
+    industries: dedupe(r.industries, 5),
+    companyTypes: dedupe(r.companyTypes, 4),
+    responsibilities: dedupe(r.responsibilities, 5),
+    dealBreakers: dedupe(r.dealBreakers, 5),
+    targetTitles: dedupe(r.targetTitles, 6),
+    searchVariants: variants,
+    coreKeywords: core.length ? core : variants[0]?.keywords.split(" ").slice(0, 4) ?? [],
   };
 }
+
+/* ─────────────── criteria prompt block ─────────────── */
+
+function criteriaBlock(criteria: Criterion[]): string {
+  return criteria.map((c) => `${c.id}. [${c.tier === "other" ? (c.kind === "dealbreaker" ? "DEAL-BREAKER" : "INFO") : c.tier.toUpperCase()}] ${c.ask}`).join("\n");
+}
+const LEVEL_RULES = `Level scale per criterion: 0 = no evidence / absent, 1 = partial, related or weaker than required, 2 = clear evidence. For DEAL-BREAKER rows: 2 = the candidate IS/HAS it, 0 = clearly not, 1 = unclear.`;
+
+const num = (n: number) => (Number.isFinite(n) ? n : -1);
 
 /* ─────────────── 2. Batch card scoring (20B) ─────────────── */
 
@@ -143,31 +202,35 @@ export interface ScoredCard {
   noticeDays: number;
   ctc: string;
   oneLineVerdict: string;
+  flags: string[];
 }
 
 export async function scoreBatch(
   rubric: Rubric,
   cards: { domId: string; rawText: string }[],
 ): Promise<{ results: ScoredCard[]; missing: string[] }> {
-  const body = cards
-    .map((c) => `<<<CARD domId="${c.domId}">>>\n${c.rawText.slice(0, 2500)}\n<<<END CARD>>>`)
-    .join("\n\n");
+  const criteria = buildCriteria(rubric);
+  const N = criteria.length;
+  const body = cards.map((c) => `<<<CARD domId="${c.domId}">>>\n${c.rawText.slice(0, 2500)}\n<<<END CARD>>>`).join("\n\n");
 
   const out = await structured({
     model: MODELS.batch,
-    name: "batch_candidate_scores",
+    name: "batch_candidate_facts",
     jsonSchema: BatchJSON,
     zod: BatchOutZ,
-    maxTokens: Math.min(8000, 400 * cards.length + 500),
+    maxTokens: Math.min(8000, 260 * cards.length + 600),
     effort: "low",
     system: `${INDIA_RULES}
 
-TASK: Score EVERY candidate card against the rubric. Return exactly one result per card, echoing its domId verbatim.
-- matchedSkills / missingSkills: use the rubric's must-have (and notable nice-to-have) skill names; max 6 each; missingSkills = must-haves with no evidence.
-- noticePeriod: human readable ("Immediate", "30 days", "Not mentioned"); noticeDays integer or -1.
-- ctc: "Current 18 LPA / Expected 24 LPA" style, or "Not disclosed".
-- oneLineVerdict: ≤ 18 words, specific (mention the strongest match and the biggest gap).`,
-    user: `RUBRIC (JSON):\n${JSON.stringify(rubric)}\n\nCANDIDATE CARDS:\n${body}`,
+TASK: For EVERY candidate card (echo its domId verbatim) do two things:
+A) Extract FACTS: expYears, noticePeriod text + noticeDays, currentCtcLpa, expectedCtcLpa, location (-1 / "" if absent).
+B) Rate each criterion below. "levels" must contain EXACTLY ${N} integers, in criterion order (index 0..${N - 1}). ${LEVEL_RULES}
+Cards are short snippets: judge from skills lists, designation, company, summary and any keyword text present.
+Also give oneLineVerdict (≤ 18 words, name the strongest match and the biggest gap; do NOT state a numeric score).
+
+CRITERIA:
+${criteriaBlock(criteria)}`,
+    user: `CANDIDATE CARDS:\n${body}`,
   });
 
   const wanted = new Set(cards.map((c) => c.domId));
@@ -175,14 +238,27 @@ TASK: Score EVERY candidate card against the rubric. Return exactly one result p
   const results: ScoredCard[] = [];
   for (const r of out.results) {
     if (!wanted.has(r.domId) || seen.has(r.domId)) continue;
+    if (r.levels.length !== N) continue; // malformed → reported as missing so the extension retries
     seen.add(r.domId);
-    const score = clampScore(r.score);
+    const facts: Facts = {
+      expYears: num(r.expYears),
+      noticeDays: num(r.noticeDays),
+      currentCtcLpa: num(r.currentCtcLpa),
+      expectedCtcLpa: num(r.expectedCtcLpa),
+      location: r.location,
+    };
+    const s = computeScore(rubric, criteria, r.levels, facts, "card");
     results.push({
-      ...r,
-      score,
-      tier: tierFor(score),
-      matchedSkills: r.matchedSkills.slice(0, 6),
-      missingSkills: r.missingSkills.slice(0, 6),
+      domId: r.domId,
+      score: s.score,
+      tier: tierFor(s.score),
+      matchedSkills: s.matched.slice(0, 6),
+      missingSkills: s.missing.slice(0, 6),
+      noticePeriod: r.noticePeriod || "Not mentioned",
+      noticeDays: facts.noticeDays,
+      ctc: ctcString(facts),
+      oneLineVerdict: r.oneLineVerdict,
+      flags: s.flags.slice(0, 3),
     });
   }
   return { results, missing: cards.map((c) => c.domId).filter((id) => !seen.has(id)) };
@@ -191,51 +267,75 @@ TASK: Score EVERY candidate card against the rubric. Return exactly one result p
 /* ─────────────── 3. Deep single-profile audit (120B) ─────────────── */
 
 export async function auditProfile(rubric: Rubric, rawText: string): Promise<Audit & { tier: string }> {
-  const a = await structured({
+  const criteria = buildCriteria(rubric);
+  const llm = await structured({
     model: MODELS.deep,
     name: "profile_audit",
     jsonSchema: AuditJSON,
-    zod: AuditZ,
-    maxTokens: 4000,
+    zod: AuditLLMZ,
+    maxTokens: 5000,
     effort: "medium",
     system: `${INDIA_RULES}
 
-TASK: Perform a deep audit of ONE candidate profile against the rubric.
-- extracted: pull identity/contact facts verbatim from the text (fullName, currentRole, currentCompany, location, email, phone). Resdex often masks contact data — use "" when not visible.
-  totalExpYears / currentCtcLpa / expectedCtcLpa as numbers (-1 if unknown); noticePeriod string + noticeDays.
-- matchedSkills / missingSkills: against must-haves AND nice-to-haves (prefix nothing; just skill names). Apply semantic equivalence.
-- strengths: 3–5 concrete, evidence-based bullets. risks: 2–4 bullets (job-hopping, gaps, seniority mismatch, stack staleness, etc.).
-- noticeFit / noticeNote: good|ok|risk|unknown against the JD's max notice period, with a one-sentence note (mention buy-out/negotiability when 60–90 days).
-- ctcFit / ctcNote: good|ok|risk|unknown against the budget (LPA), with a one-sentence note.
-- experienceNote: one sentence on experience vs. required range and relevance.
-- interviewQuestions: EXACTLY 3 tailored, technical/behavioural questions that probe the candidate's biggest gaps and verify their strongest claims.
-- verdict: 2 sentences — hire/screen recommendation with reasoning.`,
-    user: `RUBRIC (JSON):\n${JSON.stringify(rubric)}\n\nCANDIDATE PROFILE TEXT:\n"""\n${rawText.slice(0, 9000)}\n"""`,
+TASK: Audit ONE candidate profile against the criteria below.
+- extracted: identity/contact facts verbatim from the text (fullName, currentRole, currentCompany, location, email, phone; "" when masked/absent); totalExpYears, currentCtcLpa, expectedCtcLpa (-1 if unknown); noticePeriod + noticeDays.
+- checks: one entry per criterion id (0..${criteria.length - 1}) with level and a SHORT evidence quote/paraphrase from the profile (≤ 14 words; "No evidence" if level 0). ${LEVEL_RULES}
+- strengths: 3–5 concrete, evidence-based bullets. risks: 2–4 bullets (job-hopping, gaps, stack staleness, seniority mismatch, counter-offer/relocation risks).
+- noticeNote / ctcNote / experienceNote: one sentence each vs. the JD limits (mention buy-out/negotiability for 60–90 day notice).
+- interviewQuestions: EXACTLY 3 tailored questions that probe the biggest gaps/partial must-haves and verify the strongest claims.
+- verdict: 2 sentences — screen/hire recommendation with reasoning (no numeric score).
+
+JD CONTEXT: ${rubric.domainContext || rubric.title}; experience ${rubric.minExperienceYears}–${rubric.maxExperienceYears} yrs; notice ≤ ${rubric.maxNoticePeriodDays} days; budget ${rubric.ctcBudgetMinLpa}–${rubric.ctcBudgetMaxLpa} LPA; locations ${rubric.locations.join(", ") || "any"} (${rubric.remotePolicy}). (-1 = not stated)
+
+CRITERIA:
+${criteriaBlock(criteria)}`,
+    user: `CANDIDATE PROFILE TEXT:\n"""\n${rawText.slice(0, 9000)}\n"""`,
   });
-  const score = clampScore(a.score);
-  const regexContact = scrapeContact(rawText);
+
+  const x = llm.extracted;
+  const facts: Facts = {
+    expYears: num(x.totalExpYears),
+    noticeDays: num(x.noticeDays),
+    currentCtcLpa: num(x.currentCtcLpa),
+    expectedCtcLpa: num(x.expectedCtcLpa),
+    location: x.location,
+  };
+  const levels = criteria.map((c) => llm.checks.find((k) => k.id === c.id)?.level ?? 0);
+  const s = computeScore(rubric, criteria, levels, facts, "deep");
+
+  const checks = [
+    ...criteria
+      .filter((c) => c.kind !== "dealbreaker")
+      .map((c) => ({
+        label: c.name,
+        tier: c.tier,
+        level: Math.max(0, Math.min(2, Math.round(levels[c.id]))),
+        evidence: llm.checks.find((k) => k.id === c.id)?.evidence ?? "",
+      })),
+    ...s.numeric.map((n) => ({ label: n.label, tier: "fit", level: n.credit >= 0.9 ? 2 : n.credit >= 0.5 ? 1 : 0, evidence: n.evidence })),
+  ];
+  const contact = scrapeContact(rawText);
+
   return {
-    ...a,
-    score,
-    tier: tierFor(score),
-    interviewQuestions: a.interviewQuestions.slice(0, 3),
-    extracted: {
-      ...a.extracted,
-      email: a.extracted.email || regexContact.email,
-      phone: a.extracted.phone || regexContact.phone,
-    },
+    extracted: { ...x, email: x.email || contact.email, phone: x.phone || contact.phone },
+    score: s.score,
+    tier: tierFor(s.score),
+    matchedSkills: s.matched,
+    missingSkills: s.missing,
+    strengths: llm.strengths,
+    risks: llm.risks,
+    noticeFit: fitOf(s.numeric.find((n) => n.key === "notice")),
+    noticeNote: llm.noticeNote,
+    ctcFit: fitOf(s.numeric.find((n) => n.key === "ctc")),
+    ctcNote: llm.ctcNote,
+    experienceNote: llm.experienceNote,
+    interviewQuestions: llm.interviewQuestions.slice(0, 3),
+    verdict: llm.verdict,
+    checks,
+    flags: s.flags,
   };
 }
 
-/* ─────────────── helpers ─────────────── */
-
-function clampScore(n: number) {
-  return Math.max(0, Math.min(100, Math.round(Number.isFinite(n) ? n : 0)));
-}
-function dedupe(a: string[]) {
-  const seen = new Set<string>();
-  return a.map((s) => s.trim()).filter((s) => s && !seen.has(s.toLowerCase()) && seen.add(s.toLowerCase()));
-}
 export function scrapeContact(text: string) {
   const email = text.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/)?.[0] ?? "";
   const phone = text.match(/(?:\+?91[\s-]?)?[6-9]\d{9}\b/)?.[0] ?? "";

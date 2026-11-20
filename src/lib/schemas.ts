@@ -11,6 +11,7 @@ type J = Record<string, unknown>;
 const str: J = { type: "string" };
 const num: J = { type: "number" };
 const int: J = { type: "integer" };
+const bool: J = { type: "boolean" };
 const arr = (items: J): J => ({ type: "array", items });
 const en = (values: string[]): J => ({ type: "string", enum: values });
 const obj = (props: Record<string, J>): J => ({
@@ -25,20 +26,42 @@ const obj = (props: Record<string, J>): J => ({
 export const SENIORITY = ["intern", "junior", "mid", "senior", "lead", "manager", "director", "unspecified"] as const;
 export const REMOTE = ["onsite", "hybrid", "remote", "flexible", "unspecified"] as const;
 
+const strArr = () => z.array(z.string()).default([]);
+
 export const RubricZ = z.object({
   title: z.string(),
   department: z.string().default(""),
   seniority: z.enum(SENIORITY),
+
+  // Skills by priority. must = hard requirement, important = strongly preferred / core to the responsibilities, nice = bonus.
   mustHaveSkills: z.array(z.string()),
+  importantSkills: strArr(),
   niceToHaveSkills: z.array(z.string()),
+  /** "3+ years of React" → { skill: "React", years: 3 } */
+  skillMinYears: z.array(z.object({ skill: z.string(), years: z.number() })).default([]),
+  /** Equivalent / implied terms accepted as evidence for a skill (Next.js ⇒ React). */
+  skillAliases: z.array(z.object({ skill: z.string(), aliases: z.array(z.string()) })).default([]),
+
   minExperienceYears: z.number(), // -1 = not stated
   maxExperienceYears: z.number(), // -1 = not stated
   maxNoticePeriodDays: z.number(), // -1 = not stated
   ctcBudgetMinLpa: z.number(), // -1 = not stated
   ctcBudgetMaxLpa: z.number(), // -1 = not stated
+
+  education: z.string().default(""), // "B.Tech/BE in CS or equivalent" or ""
+  educationRequired: z.boolean().default(false),
+  certifications: strArr(),
+  industries: strArr(), // domains/industries the candidate should have worked in
+  companyTypes: strArr(), // "product company", "startup", "MNC", "SaaS" …
+  responsibilities: strArr(), // key things the person must have actually done
+  dealBreakers: strArr(), // explicit exclusions in the JD ("no freshers", "not from service companies")
+
   locations: z.array(z.string()),
   remotePolicy: z.enum(REMOTE),
   domainContext: z.string(),
+
+  targetTitles: strArr(), // alternate designations to look for
+  searchVariants: z.array(z.object({ label: z.string(), keywords: z.string() })).default([]),
   coreKeywords: z.array(z.string()),
 });
 export type Rubric = z.infer<typeof RubricZ>;
@@ -48,43 +71,58 @@ export const RubricJSON = obj({
   department: str,
   seniority: en([...SENIORITY]),
   mustHaveSkills: arr(str),
+  importantSkills: arr(str),
   niceToHaveSkills: arr(str),
+  skillMinYears: arr(obj({ skill: str, years: num })),
+  skillAliases: arr(obj({ skill: str, aliases: arr(str) })),
   minExperienceYears: num,
   maxExperienceYears: num,
   maxNoticePeriodDays: int,
   ctcBudgetMinLpa: num,
   ctcBudgetMaxLpa: num,
+  education: str,
+  educationRequired: bool,
+  certifications: arr(str),
+  industries: arr(str),
+  companyTypes: arr(str),
+  responsibilities: arr(str),
+  dealBreakers: arr(str),
   locations: arr(str),
   remotePolicy: en([...REMOTE]),
   domainContext: str,
+  targetTitles: arr(str),
+  searchVariants: arr(obj({ label: str, keywords: str })),
   coreKeywords: arr(str),
 });
 
-/* ─────────────── Batch card scoring ─────────────── */
+/* ─────────────── Batch card scoring ───────────────
+ * The model only reports FACTS (extracted numbers) and a per-criterion evidence LEVEL.
+ * The score itself is computed deterministically on the server (lib/scoring.ts). */
 
-export const CardResultZ = z.object({
+export const CardFactsZ = z.object({
   domId: z.string(),
-  score: z.number(),
-  matchedSkills: z.array(z.string()),
-  missingSkills: z.array(z.string()),
+  levels: z.array(z.number()), // one per criterion, in order: 0 none · 1 partial · 2 clear (dealbreaker: 2 = present)
+  expYears: z.number(),
   noticePeriod: z.string(),
-  noticeDays: z.number(), // -1 unknown
-  ctc: z.string(),
+  noticeDays: z.number(),
+  currentCtcLpa: z.number(),
+  expectedCtcLpa: z.number(),
+  location: z.string(),
   oneLineVerdict: z.string(),
 });
-export const BatchOutZ = z.object({ results: z.array(CardResultZ) });
-export type BatchOut = z.infer<typeof BatchOutZ>;
+export const BatchOutZ = z.object({ results: z.array(CardFactsZ) });
 
 export const BatchJSON = obj({
   results: arr(
     obj({
       domId: str,
-      score: int,
-      matchedSkills: arr(str),
-      missingSkills: arr(str),
+      levels: arr(int),
+      expYears: num,
       noticePeriod: str,
       noticeDays: int,
-      ctc: str,
+      currentCtcLpa: num,
+      expectedCtcLpa: num,
+      location: str,
       oneLineVerdict: str,
     }),
   ),
@@ -94,34 +132,32 @@ export const BatchJSON = obj({
 
 const FIT = ["good", "ok", "risk", "unknown"] as const;
 
-export const AuditZ = z.object({
-  extracted: z.object({
-    fullName: z.string(),
-    currentRole: z.string(),
-    currentCompany: z.string(),
-    totalExpYears: z.number(), // -1 unknown
-    currentCtcLpa: z.number(), // -1 unknown
-    expectedCtcLpa: z.number(), // -1 unknown
-    noticePeriod: z.string(),
-    noticeDays: z.number(),
-    location: z.string(),
-    email: z.string(),
-    phone: z.string(),
-  }),
-  score: z.number(),
-  matchedSkills: z.array(z.string()),
-  missingSkills: z.array(z.string()),
+const ExtractedZ = z.object({
+  fullName: z.string(),
+  currentRole: z.string(),
+  currentCompany: z.string(),
+  totalExpYears: z.number(), // -1 unknown
+  currentCtcLpa: z.number(), // -1 unknown
+  expectedCtcLpa: z.number(), // -1 unknown
+  noticePeriod: z.string(),
+  noticeDays: z.number(),
+  location: z.string(),
+  email: z.string(),
+  phone: z.string(),
+});
+
+/** What the model returns. */
+export const AuditLLMZ = z.object({
+  extracted: ExtractedZ,
+  checks: z.array(z.object({ id: z.number(), level: z.number(), evidence: z.string() })),
   strengths: z.array(z.string()),
   risks: z.array(z.string()),
-  noticeFit: z.enum(FIT),
   noticeNote: z.string(),
-  ctcFit: z.enum(FIT),
   ctcNote: z.string(),
   experienceNote: z.string(),
   interviewQuestions: z.array(z.string()),
   verdict: z.string(),
 });
-export type Audit = z.infer<typeof AuditZ>;
 
 export const AuditJSON = obj({
   extracted: obj({
@@ -137,19 +173,42 @@ export const AuditJSON = obj({
     email: str,
     phone: str,
   }),
-  score: int,
-  matchedSkills: arr(str),
-  missingSkills: arr(str),
+  checks: arr(obj({ id: int, level: int, evidence: str })),
   strengths: arr(str),
   risks: arr(str),
-  noticeFit: en([...FIT]),
   noticeNote: str,
-  ctcFit: en([...FIT]),
   ctcNote: str,
   experienceNote: str,
   interviewQuestions: arr(str),
   verdict: str,
 });
+
+export const CheckZ = z.object({
+  label: z.string(),
+  tier: z.string(), // must | important | nice | other | fit
+  level: z.number(), // 0 | 1 | 2
+  evidence: z.string(),
+});
+
+/** Final audit = LLM facts + server-computed score/fits. This is what the extension stores and imports. */
+export const AuditZ = z.object({
+  extracted: ExtractedZ,
+  score: z.number(),
+  matchedSkills: z.array(z.string()),
+  missingSkills: z.array(z.string()),
+  strengths: z.array(z.string()),
+  risks: z.array(z.string()),
+  noticeFit: z.enum(FIT),
+  noticeNote: z.string(),
+  ctcFit: z.enum(FIT),
+  ctcNote: z.string(),
+  experienceNote: z.string(),
+  interviewQuestions: z.array(z.string()),
+  verdict: z.string(),
+  checks: z.array(CheckZ).default([]),
+  flags: z.array(z.string()).default([]),
+});
+export type Audit = z.infer<typeof AuditZ>;
 
 /* ─────────────── Request bodies ─────────────── */
 

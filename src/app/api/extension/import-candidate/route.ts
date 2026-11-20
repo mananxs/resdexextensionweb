@@ -70,6 +70,8 @@ export function POST(req: NextRequest) {
         ctcFit: audit.ctcFit,
         ctcNote: audit.ctcNote,
         experienceNote: audit.experienceNote,
+        checks: audit.checks,
+        flags: audit.flags,
       } as Prisma.InputJsonValue,
     };
 

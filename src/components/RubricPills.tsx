@@ -47,6 +47,15 @@ export default function RubricPills({ rubric }: { rubric: Rubric }) {
           </Pill>
         ))}
       </Row>
+      {(rubric.importantSkills ?? []).length > 0 && (
+        <Row label="Important skills">
+          {rubric.importantSkills.map((s) => (
+            <Pill key={s} tone="must">
+              {s}
+            </Pill>
+          ))}
+        </Row>
+      )}
       {rubric.niceToHaveSkills.length > 0 && (
         <Row label="Nice-to-have">
           {rubric.niceToHaveSkills.map((s) => (
@@ -69,6 +78,33 @@ export default function RubricPills({ rubric }: { rubric: Rubric }) {
         <div>
           <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Domain context</div>
           <p className="text-sm text-slate-700">{rubric.domainContext}</p>
+        </div>
+      )}
+      {((rubric.education ?? "") || (rubric.certifications ?? []).length > 0 || (rubric.industries ?? []).length > 0) && (
+        <Row label="Background asked for">
+          {rubric.education && <Pill tone="meta">🎓 {rubric.education}</Pill>}
+          {(rubric.certifications ?? []).map((c) => <Pill key={c} tone="meta">📜 {c}</Pill>)}
+          {(rubric.industries ?? []).map((c) => <Pill key={c} tone="meta">{c}</Pill>)}
+          {(rubric.companyTypes ?? []).map((c) => <Pill key={c} tone="meta">{c}</Pill>)}
+        </Row>
+      )}
+      {(rubric.dealBreakers ?? []).length > 0 && (
+        <Row label="Deal-breakers">
+          {rubric.dealBreakers.map((c) => (
+            <span key={c} className="rounded-full bg-rose-50 px-2.5 py-0.5 text-xs font-medium text-rose-700 ring-1 ring-inset ring-rose-200">⛔ {c}</span>
+          ))}
+        </Row>
+      )}
+      {(rubric.searchVariants ?? []).length > 0 && (
+        <div>
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Resdex search plan</div>
+          <ul className="space-y-1 text-sm">
+            {rubric.searchVariants.map((v) => (
+              <li key={v.label}>
+                <b className="text-slate-700">{v.label}:</b> <code className="rounded bg-violet-50 px-1.5 py-0.5 text-violet-700">{v.keywords}</code>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
       {rubric.coreKeywords.length > 0 && (

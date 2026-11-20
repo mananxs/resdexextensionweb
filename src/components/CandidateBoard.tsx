@@ -205,6 +205,31 @@ export default function CandidateBoard({ candidates: initial }: { candidates: Ca
               </div>
             )}
 
+            {open.audit?.flags?.length ? (
+              <div className="mt-4 space-y-1">
+                {open.audit.flags.map((f) => (
+                  <div key={f} className="rounded bg-rose-50 px-2 py-1 text-xs font-medium text-rose-700">⚠ {f}</div>
+                ))}
+              </div>
+            ) : null}
+            {open.audit?.checks?.length ? (
+              <Section title="Requirement checklist">
+                <ul className="divide-y divide-slate-100 rounded-lg border border-slate-200 text-sm">
+                  {open.audit.checks.map((c) => (
+                    <li key={c.label} className="flex items-start gap-2 px-3 py-1.5">
+                      <span className={c.level === 2 ? "text-emerald-600" : c.level === 1 ? "text-amber-500" : "text-rose-500"}>{c.level === 2 ? "✓" : c.level === 1 ? "◐" : "✕"}</span>
+                      <div className="min-w-0 flex-1">
+                        <div className="font-medium">
+                          {c.label}
+                          {c.tier === "must" && <span className="ml-1.5 rounded bg-indigo-50 px-1 text-[10px] font-semibold uppercase text-indigo-600">must</span>}
+                        </div>
+                        {c.evidence && <div className="text-xs text-slate-500">{c.evidence}</div>}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </Section>
+            ) : null}
             <Section title="Matched skills">
               <Chips items={open.matchedSkills} cls="bg-emerald-50 text-emerald-700" />
             </Section>

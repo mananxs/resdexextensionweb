@@ -26,6 +26,8 @@ export interface CandidateDTO {
     ctcFit?: string;
     ctcNote?: string;
     experienceNote?: string;
+    checks?: { label: string; tier: string; level: number; evidence: string }[];
+    flags?: string[];
   } | null;
   status: "SHORTLISTED" | "CONTACTED" | "INTERVIEWING" | "OFFERED" | "REJECTED";
   createdAt: string;
