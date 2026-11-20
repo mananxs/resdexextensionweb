@@ -3,8 +3,8 @@ import Link from "next/link";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Resdex AI Co-Pilot",
-  description: "AI sourcing co-pilot for Naukri Resdex, powered by Groq",
+  title: "XS-NaukriAI",
+  description: "AI sourcing agent for Naukri Resdex, powered by xs-naukriai",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -15,7 +15,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <div className="mx-auto flex h-14 max-w-6xl items-center justify-between px-4">
             <Link href="/jobs" className="flex items-center gap-2 font-semibold">
               <span className="grid h-8 w-8 place-items-center rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 text-sm font-bold text-white shadow-md shadow-indigo-500/30">R</span>
-              Resdex Co-Pilot
+              XS-NaukriAI
             </Link>
             <nav className="flex items-center gap-1 text-sm">
               <Link href="/jobs" className="rounded-md px-3 py-1.5 text-slate-600 hover:bg-slate-100">
