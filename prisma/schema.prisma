@@ -1,0 +1,80 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url       = env("DATABASE_URL") // Neon pooled connection (host contains -pooler)
+  directUrl = env("DIRECT_URL") // Neon direct connection, used by prisma migrate
+}
+
+model User {
+  id              String   @id @default(cuid())
+  email           String   @unique
+  name            String?
+  extensionApiKey String   @unique
+  createdAt       DateTime @default(now())
+  jobs            Job[]
+}
+
+enum JobStatus {
+  ACTIVE
+  PAUSED
+  CLOSED
+}
+
+model Job {
+  id               String      @id @default(cuid())
+  userId           String
+  user             User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title            String
+  department       String?
+  location         String?
+  rawDescription   String
+  parsedRubricJson Json
+  status           JobStatus   @default(ACTIVE)
+  createdAt        DateTime    @default(now())
+  candidates       Candidate[]
+
+  @@index([userId, createdAt])
+}
+
+enum CandidateStatus {
+  SHORTLISTED
+  CONTACTED
+  INTERVIEWING
+  OFFERED
+  REJECTED
+}
+
+model Candidate {
+  id                 String          @id @default(cuid())
+  jobId              String
+  job                Job             @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  fullName           String
+  currentRole        String?
+  currentCompany     String?
+  totalExp           Float? // years
+  currentCtc         Float? // LPA
+  expectedCtc        Float? // LPA
+  noticePeriod       String?
+  location           String?
+  email              String?
+  phone              String?
+  naukriProfileUrl   String?
+  rawProfileText     String?
+  aiScore            Int
+  aiTier             String
+  matchedSkills      String[]
+  missingSkills      String[]
+  aiVerdict          String
+  interviewQuestions String[]
+  auditJson          Json? // strengths, risks, notice/CTC/experience fit notes
+  status             CandidateStatus @default(SHORTLISTED)
+  createdAt          DateTime        @default(now())
+
+  @@index([jobId, aiScore])
+  @@index([jobId, email])
+  @@index([jobId, phone])
+  @@index([jobId, naukriProfileUrl])
+}

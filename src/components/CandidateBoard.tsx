@@ -1,0 +1,287 @@
+"use client";
+
+import { useMemo, useState } from "react";
+import { noticeToDays, tierClasses } from "@/lib/tier";
+import { STATUSES, type CandidateDTO } from "@/lib/types";
+
+const LABEL: Record<CandidateDTO["status"], string> = {
+  SHORTLISTED: "Shortlisted",
+  CONTACTED: "Contacted",
+  INTERVIEWING: "Interviewing",
+  OFFERED: "Offered",
+  REJECTED: "Rejected",
+};
+
+const FIT_CLS: Record<string, string> = {
+  good: "text-emerald-700 bg-emerald-50",
+  ok: "text-amber-700 bg-amber-50",
+  risk: "text-rose-700 bg-rose-50",
+  unknown: "text-slate-600 bg-slate-100",
+};
+
+function ScorePill({ score }: { score: number }) {
+  return <span className={`rounded-full px-2 py-0.5 text-xs font-bold ring-1 ring-inset ${tierClasses(score)}`}>{score}%</span>;
+}
+
+export default function CandidateBoard({ candidates: initial }: { candidates: CandidateDTO[] }) {
+  const [items, setItems] = useState(initial);
+  const [view, setView] = useState<"kanban" | "table">("kanban");
+  const [minScore, setMinScore] = useState(0);
+  const [maxNotice, setMaxNotice] = useState(0); // 0 = any
+  const [q, setQ] = useState("");
+  const [openId, setOpenId] = useState<string | null>(null);
+
+  const filtered = useMemo(
+    () =>
+      items
+        .filter((c) => c.aiScore >= minScore)
+        .filter((c) => {
+          if (!maxNotice) return true;
+          const d = noticeToDays(c.noticePeriod);
+          return d !== null && d <= maxNotice;
+        })
+        .filter((c) => !q || `${c.fullName} ${c.currentRole} ${c.currentCompany} ${c.matchedSkills.join(" ")}`.toLowerCase().includes(q.toLowerCase()))
+        .sort((a, b) => b.aiScore - a.aiScore),
+    [items, minScore, maxNotice, q],
+  );
+  const open = items.find((c) => c.id === openId) ?? null;
+
+  async function setStatus(id: string, status: CandidateDTO["status"]) {
+    const prev = items;
+    setItems((xs) => xs.map((c) => (c.id === id ? { ...c, status } : c)));
+    const res = await fetch(`/api/candidates/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    });
+    if (!res.ok) setItems(prev);
+  }
+
+  function Card({ c }: { c: CandidateDTO }) {
+    return (
+      <button onClick={() => setOpenId(c.id)} className="card w-full p-3 text-left transition hover:-translate-y-0.5 hover:border-indigo-300 hover:shadow-md">
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <div className="truncate text-sm font-semibold">{c.fullName}</div>
+            <div className="truncate text-xs text-slate-500">{[c.currentRole, c.currentCompany].filter(Boolean).join(" @ ")}</div>
+          </div>
+          <ScorePill score={c.aiScore} />
+        </div>
+        <div className="mt-2 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-slate-500">
+          {c.totalExp !== null && <span>{c.totalExp} yrs</span>}
+          {c.currentCtc !== null && <span>{c.currentCtc} LPA</span>}
+          {c.noticePeriod && <span>{c.noticePeriod}</span>}
+        </div>
+        <p className="mt-2 line-clamp-2 text-xs text-slate-600">{c.aiVerdict}</p>
+      </button>
+    );
+  }
+
+  return (
+    <div>
+      <div className="mb-4 flex flex-wrap items-center gap-3">
+        <input className="input max-w-xs" placeholder="Search name, role, skill…" value={q} onChange={(e) => setQ(e.target.value)} />
+        <select className="input w-auto" value={minScore} onChange={(e) => setMinScore(+e.target.value)}>
+          <option value={0}>Any score</option>
+          <option value={60}>60%+ (Good fit)</option>
+          <option value={80}>80%+ (Top match)</option>
+        </select>
+        <select className="input w-auto" value={maxNotice} onChange={(e) => setMaxNotice(+e.target.value)}>
+          <option value={0}>Any notice period</option>
+          <option value={15}>≤ 15 days</option>
+          <option value={30}>≤ 30 days</option>
+          <option value={60}>≤ 60 days</option>
+        </select>
+        <div className="ml-auto flex rounded-lg border border-slate-300 bg-white p-0.5 text-sm">
+          {(["kanban", "table"] as const).map((v) => (
+            <button key={v} onClick={() => setView(v)} className={`rounded-md px-3 py-1 capitalize ${view === v ? "bg-indigo-600 text-white" : "text-slate-600"}`}>
+              {v}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {items.length === 0 ? (
+        <div className="card p-12 text-center">
+          <p className="font-medium">No candidates shortlisted yet</p>
+          <p className="mt-1 text-sm text-slate-500">Open a profile on Resdex and click “Save & Shortlist to Platform” in the extension side panel.</p>
+        </div>
+      ) : view === "kanban" ? (
+        <div className="grid gap-4 overflow-x-auto md:grid-cols-5">
+          {STATUSES.map((s) => {
+            const col = filtered.filter((c) => c.status === s);
+            return (
+              <div key={s} className="min-w-[220px] rounded-xl bg-slate-100 p-2">
+                <div className="mb-2 flex items-center justify-between px-1 text-xs font-semibold uppercase tracking-wide text-slate-600">
+                  {LABEL[s]} <span className="rounded bg-white px-1.5 py-0.5 text-slate-500">{col.length}</span>
+                </div>
+                <div className="space-y-2">
+                  {col.map((c) => (
+                    <Card key={c.id} c={c} />
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="card overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead className="border-b border-slate-200 bg-slate-50 text-xs uppercase text-slate-500">
+              <tr>
+                {["Score", "Candidate", "Exp", "CTC (cur → exp)", "Notice", "Location", "Status"].map((h) => (
+                  <th key={h} className="px-3 py-2 font-medium">
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((c) => (
+                <tr key={c.id} onClick={() => setOpenId(c.id)} className="cursor-pointer border-b border-slate-100 hover:bg-slate-50">
+                  <td className="px-3 py-2">
+                    <ScorePill score={c.aiScore} />
+                  </td>
+                  <td className="px-3 py-2">
+                    <div className="font-medium">{c.fullName}</div>
+                    <div className="text-xs text-slate-500">{[c.currentRole, c.currentCompany].filter(Boolean).join(" @ ")}</div>
+                  </td>
+                  <td className="px-3 py-2">{c.totalExp ?? "—"}</td>
+                  <td className="px-3 py-2">
+                    {c.currentCtc ?? "—"} → {c.expectedCtc ?? "—"}
+                  </td>
+                  <td className="px-3 py-2">{c.noticePeriod ?? "—"}</td>
+                  <td className="px-3 py-2">{c.location ?? "—"}</td>
+                  <td className="px-3 py-2">{LABEL[c.status]}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {open && (
+        <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/40 backdrop-blur-[2px] animate-fade" onClick={() => setOpenId(null)}>
+          <aside className="h-full w-full max-w-lg overflow-y-auto bg-white p-6 shadow-2xl animate-slide" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-semibold">{open.fullName}</h2>
+                <p className="text-sm text-slate-500">{[open.currentRole, open.currentCompany].filter(Boolean).join(" @ ")}</p>
+              </div>
+              <button onClick={() => setOpenId(null)} aria-label="Close" className="text-slate-500 hover:text-slate-900">
+                ✕
+              </button>
+            </div>
+
+            <div className="mt-4 flex items-center gap-3">
+              <span className={`rounded-full px-3 py-1 text-lg font-bold ring-1 ring-inset ${tierClasses(open.aiScore)}`}>{open.aiScore}%</span>
+              <span className="text-sm font-medium text-slate-700">{open.aiTier}</span>
+              <select className="input ml-auto w-auto" value={open.status} onChange={(e) => setStatus(open.id, e.target.value as CandidateDTO["status"])}>
+                {STATUSES.map((s) => (
+                  <option key={s} value={s}>
+                    {LABEL[s]}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <p className="mt-3 text-sm text-slate-700">{open.aiVerdict}</p>
+
+            <dl className="mt-4 grid grid-cols-2 gap-3 rounded-lg bg-slate-50 p-3 text-sm">
+              <Info k="Experience" v={open.totalExp !== null ? `${open.totalExp} yrs` : null} />
+              <Info k="Notice period" v={open.noticePeriod} />
+              <Info k="Current CTC" v={open.currentCtc !== null ? `${open.currentCtc} LPA` : null} />
+              <Info k="Expected CTC" v={open.expectedCtc !== null ? `${open.expectedCtc} LPA` : null} />
+              <Info k="Location" v={open.location} />
+              <Info k="Email" v={open.email} />
+              <Info k="Phone" v={open.phone} />
+            </dl>
+
+            {open.audit && (
+              <div className="mt-4 space-y-2 text-sm">
+                {open.audit.noticeNote && <Fit label="Notice period" fit={open.audit.noticeFit} note={open.audit.noticeNote} />}
+                {open.audit.ctcNote && <Fit label="CTC" fit={open.audit.ctcFit} note={open.audit.ctcNote} />}
+                {open.audit.experienceNote && <p className="rounded bg-slate-50 p-2 text-slate-700">{open.audit.experienceNote}</p>}
+              </div>
+            )}
+
+            <Section title="Matched skills">
+              <Chips items={open.matchedSkills} cls="bg-emerald-50 text-emerald-700" />
+            </Section>
+            <Section title="Gaps / missing">
+              <Chips items={open.missingSkills} cls="bg-rose-50 text-rose-700" />
+            </Section>
+            {open.audit?.strengths?.length ? (
+              <Section title="Strengths">
+                <List items={open.audit.strengths} />
+              </Section>
+            ) : null}
+            {open.audit?.risks?.length ? (
+              <Section title="Risks">
+                <List items={open.audit.risks} />
+              </Section>
+            ) : null}
+            <Section title="Interview talking points">
+              <ol className="list-decimal space-y-1.5 pl-5 text-sm text-slate-700">
+                {open.interviewQuestions.map((q) => (
+                  <li key={q}>{q}</li>
+                ))}
+              </ol>
+            </Section>
+
+            {open.naukriProfileUrl && (
+              <a href={open.naukriProfileUrl} target="_blank" rel="noreferrer" className="btn-primary mt-6 w-full">
+                Open on Resdex ↗
+              </a>
+            )}
+          </aside>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Info({ k, v }: { k: string; v: string | null }) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-[11px] uppercase tracking-wide text-slate-500">{k}</dt>
+      <dd className="truncate font-medium">{v ?? "—"}</dd>
+    </div>
+  );
+}
+function Fit({ label, fit, note }: { label: string; fit?: string; note: string }) {
+  return (
+    <div className={`rounded p-2 ${FIT_CLS[fit ?? "unknown"]}`}>
+      <b>{label}:</b> {note}
+    </div>
+  );
+}
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="mt-5">
+      <h3 className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-slate-500">{title}</h3>
+      {children}
+    </div>
+  );
+}
+function Chips({ items, cls }: { items: string[]; cls: string }) {
+  if (!items.length) return <p className="text-sm text-slate-400">None</p>;
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {items.map((s) => (
+        <span key={s} className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${cls}`}>
+          {s}
+        </span>
+      ))}
+    </div>
+  );
+}
+function List({ items }: { items: string[] }) {
+  return (
+    <ul className="list-disc space-y-1 pl-5 text-sm text-slate-700">
+      {items.map((s) => (
+        <li key={s}>{s}</li>
+      ))}
+    </ul>
+  );
+}
