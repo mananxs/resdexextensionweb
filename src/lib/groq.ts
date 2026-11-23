@@ -50,15 +50,25 @@ interface StructuredArgs<T> {
   effort: "low" | "medium" | "high";
 }
 
+const EFFORTS = ["low", "medium", "high"] as const;
+
+/** Groq's "json_validate_failed" (empty or truncated generation) — almost always the reasoning ate the token budget. */
+function isJsonFailure(e: unknown) {
+  const err = e as { status?: number; message?: string };
+  return err.status === 400 && /json_validate_failed|Failed to (validate|generate) JSON/i.test(err.message ?? "");
+}
+
 async function structured<T>(a: StructuredArgs<T>): Promise<T> {
   let lastErr: unknown;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  let maxTokens = a.maxTokens;
+  let effort = a.effort;
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const res = await client().chat.completions.create({
         model: a.model,
         temperature: 0.1,
-        max_completion_tokens: a.maxTokens,
-        reasoning_effort: a.effort,
+        max_completion_tokens: maxTokens,
+        reasoning_effort: effort,
         messages: [
           { role: "system", content: a.system },
           { role: "user", content: a.user },
@@ -68,11 +78,17 @@ async function structured<T>(a: StructuredArgs<T>): Promise<T> {
       } as any);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const content = (res as any).choices?.[0]?.message?.content as string | undefined;
-      if (!content) throw new Error("Empty response from Groq");
+      if (!content) throw Object.assign(new Error("Empty response from Groq"), { retryable: true });
       return a.zod.parse(JSON.parse(content));
     } catch (e) {
       lastErr = e;
       const status = (e as { status?: number }).status;
+      if (isJsonFailure(e) || (e as { retryable?: boolean }).retryable || e instanceof SyntaxError) {
+        // Escalate: more room for the answer, less reasoning.
+        maxTokens = Math.min(16000, Math.round(maxTokens * 1.7));
+        effort = EFFORTS[Math.max(0, EFFORTS.indexOf(effort) - 1)];
+        continue;
+      }
       if (status && status !== 429 && status < 500) break; // non-retryable (auth, bad request)
     }
   }
@@ -120,8 +136,8 @@ export async function extractRubric(rawJd: string): Promise<Rubric> {
     name: "jd_rubric",
     jsonSchema: RubricJSON,
     zod: RubricZ,
-    maxTokens: 5000,
-    effort: "high",
+    maxTokens: 8000,
+    effort: "medium",
     system: `${INDIA_RULES}\n\nTASK: Read EVERY sentence of the job description and convert it into a precise evaluation rubric. Nothing in the JD should be lost, and nothing should be invented.\n${RUBRIC_SPEC}`,
     user: `JOB DESCRIPTION:\n"""\n${jd}\n"""`,
   });
@@ -134,8 +150,8 @@ export async function extractRubric(rawJd: string): Promise<Rubric> {
       name: "jd_rubric_refined",
       jsonSchema: RubricJSON,
       zod: RubricZ,
-      maxTokens: 5000,
-      effort: "medium",
+      maxTokens: 8000,
+      effort: "low",
       system: `${INDIA_RULES}\n\nTASK: You are a strict reviewer of a draft rubric extracted from a JD. Re-read the JD line by line and fix the draft:
 1. Any requirement, tool, responsibility, qualification, number (years/CTC/notice) or location in the JD that is missing → add it.
 2. Wrong priority (e.g. a mandatory item listed as nice-to-have, or vice-versa) → move it. A skill must be in only one list.
@@ -250,7 +266,28 @@ export interface ScoredCard {
   flags: string[];
 }
 
+/**
+ * Scores a batch; if the model can't produce valid JSON for it (too big / too much reasoning), the batch is
+ * split in half and retried so one bad card can't sink the whole page. A single card that still fails is reported as `missing`.
+ */
 export async function scoreBatch(
+  rubric: Rubric,
+  cards: { domId: string; rawText: string }[],
+): Promise<{ results: ScoredCard[]; missing: string[] }> {
+  try {
+    return await scoreBatchOnce(rubric, cards);
+  } catch (e) {
+    const err = e as { status?: number };
+    const recoverable = isJsonFailure(e) || e instanceof SyntaxError || /Empty response|Zod|invalid/i.test((e as Error).message ?? "");
+    if (!recoverable || err.status === 429) throw e;
+    if (cards.length <= 1) return { results: [], missing: cards.map((c) => c.domId) };
+    const mid = Math.ceil(cards.length / 2);
+    const [a, b] = [await scoreBatch(rubric, cards.slice(0, mid)), await scoreBatch(rubric, cards.slice(mid))];
+    return { results: [...a.results, ...b.results], missing: [...a.missing, ...b.missing] };
+  }
+}
+
+async function scoreBatchOnce(
   rubric: Rubric,
   cards: { domId: string; rawText: string }[],
 ): Promise<{ results: ScoredCard[]; missing: string[] }> {
