@@ -1,8 +1,9 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { noticeToDays, tierClasses } from "@/lib/tier";
 import { STATUSES, type CandidateDTO } from "@/lib/types";
+import ResumeUploader from "./ResumeUploader";
 
 const LABEL: Record<CandidateDTO["status"], string> = {
   SHORTLISTED: "Shortlisted",
@@ -23,8 +24,13 @@ function ScorePill({ score }: { score: number }) {
   return <span className={`rounded-full px-2 py-0.5 text-xs font-bold ring-1 ring-inset ${tierClasses(score)}`}>{score}%</span>;
 }
 
-export default function CandidateBoard({ candidates: initial }: { candidates: CandidateDTO[] }) {
+function CardOnlyBadge() {
+  return <span className="rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600" title="Saved from a search card — profile not opened yet, no contact details">Card only</span>;
+}
+
+export default function CandidateBoard({ jobId, candidates: initial }: { jobId: string; candidates: CandidateDTO[] }) {
   const [items, setItems] = useState(initial);
+  const upsertItem = useCallback((c: CandidateDTO) => setItems((xs) => (xs.some((x) => x.id === c.id) ? xs.map((x) => (x.id === c.id ? c : x)) : [c, ...xs])), []);
   const [view, setView] = useState<"kanban" | "table">("kanban");
   const [minScore, setMinScore] = useState(0);
   const [maxNotice, setMaxNotice] = useState(0); // 0 = any
@@ -65,7 +71,10 @@ export default function CandidateBoard({ candidates: initial }: { candidates: Ca
             <div className="truncate text-sm font-semibold">{c.fullName}</div>
             <div className="truncate text-xs text-slate-500">{[c.currentRole, c.currentCompany].filter(Boolean).join(" @ ")}</div>
           </div>
-          <ScorePill score={c.aiScore} />
+          <div className="flex shrink-0 flex-col items-end gap-1">
+            <ScorePill score={c.aiScore} />
+            {c.profileLevel === "card" && <CardOnlyBadge />}
+          </div>
         </div>
         <div className="mt-2 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-slate-500">
           {c.totalExp !== null && <span>{c.totalExp} yrs</span>}
@@ -79,6 +88,7 @@ export default function CandidateBoard({ candidates: initial }: { candidates: Ca
 
   return (
     <div>
+      <ResumeUploader jobId={jobId} onCandidate={upsertItem} />
       <div className="mb-4 flex flex-wrap items-center gap-3">
         <input className="input max-w-xs" placeholder="Search name, role, skill…" value={q} onChange={(e) => setQ(e.target.value)} />
         <select className="input w-auto" value={minScore} onChange={(e) => setMinScore(+e.target.value)}>
@@ -104,7 +114,7 @@ export default function CandidateBoard({ candidates: initial }: { candidates: Ca
       {items.length === 0 ? (
         <div className="card p-12 text-center">
           <p className="font-medium">No candidates shortlisted yet</p>
-          <p className="mt-1 text-sm text-slate-500">Open a profile on Resdex and click “Save & Shortlist to Platform” in the extension side panel.</p>
+          <p className="mt-1 text-sm text-slate-500">Save a card or profile from the Resdex extension, or upload resumes (PDF/DOCX) above.</p>
         </div>
       ) : view === "kanban" ? (
         <div className="grid gap-4 overflow-x-auto md:grid-cols-5">
@@ -143,7 +153,9 @@ export default function CandidateBoard({ candidates: initial }: { candidates: Ca
                     <ScorePill score={c.aiScore} />
                   </td>
                   <td className="px-3 py-2">
-                    <div className="font-medium">{c.fullName}</div>
+                    <div className="flex items-center gap-2 font-medium">
+                      {c.fullName} {c.profileLevel === "card" && <CardOnlyBadge />}
+                    </div>
                     <div className="text-xs text-slate-500">{[c.currentRole, c.currentCompany].filter(Boolean).join(" @ ")}</div>
                   </td>
                   <td className="px-3 py-2">{c.totalExp ?? "—"}</td>
@@ -176,6 +188,7 @@ export default function CandidateBoard({ candidates: initial }: { candidates: Ca
             <div className="mt-4 flex items-center gap-3">
               <span className={`rounded-full px-3 py-1 text-lg font-bold ring-1 ring-inset ${tierClasses(open.aiScore)}`}>{open.aiScore}%</span>
               <span className="text-sm font-medium text-slate-700">{open.aiTier}</span>
+              {open.profileLevel === "card" && <CardOnlyBadge />}
               <select className="input ml-auto w-auto" value={open.status} onChange={(e) => setStatus(open.id, e.target.value as CandidateDTO["status"])}>
                 {STATUSES.map((s) => (
                   <option key={s} value={s}>
@@ -246,14 +259,27 @@ export default function CandidateBoard({ candidates: initial }: { candidates: Ca
                 <List items={open.audit.risks} />
               </Section>
             ) : null}
-            <Section title="Interview talking points">
-              <ol className="list-decimal space-y-1.5 pl-5 text-sm text-slate-700">
-                {open.interviewQuestions.map((q) => (
-                  <li key={q}>{q}</li>
-                ))}
-              </ol>
-            </Section>
+            {open.interviewQuestions.length > 0 ? (
+              <Section title="Interview talking points">
+                <ol className="list-decimal space-y-1.5 pl-5 text-sm text-slate-700">
+                  {open.interviewQuestions.map((q) => (
+                    <li key={q}>{q}</li>
+                  ))}
+                </ol>
+              </Section>
+            ) : (
+              open.profileLevel === "card" && (
+                <p className="mt-5 rounded bg-slate-50 p-2 text-xs text-slate-600">
+                  Saved from a search card — no CV view was spent. Email/phone and the deep audit are added automatically if you later open the profile and click “Save &amp; Shortlist”.
+                </p>
+              )
+            )}
 
+            {open.resumeName && (
+              <a href={`/api/candidates/${open.id}/resume`} className="btn-ghost mt-6 w-full" download>
+                Download resume · {open.resumeName}
+              </a>
+            )}
             {open.naukriProfileUrl && (
               <a href={open.naukriProfileUrl} target="_blank" rel="noreferrer" className="btn-primary mt-6 w-full">
                 Open on Resdex ↗

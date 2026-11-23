@@ -70,6 +70,9 @@ model Candidate {
   aiVerdict          String
   interviewQuestions String[]
   auditJson          Json? // strengths, risks, notice/CTC/experience fit notes
+  resumeName         String? // original file name of an uploaded resume (PDF/DOCX)
+  resumeMime         String?
+  resumeData         Bytes? // the file itself (≤ 5 MB); never selected in list queries
   status             CandidateStatus @default(SHORTLISTED)
   createdAt          DateTime        @default(now())
 

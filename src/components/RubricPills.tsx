@@ -95,6 +95,13 @@ export default function RubricPills({ rubric }: { rubric: Rubric }) {
           ))}
         </Row>
       )}
+      {(rubric.booleanQuery ?? "") && (
+        <div>
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Resdex Boolean query</div>
+          <code className="block break-words rounded bg-violet-50 px-2 py-1.5 text-xs text-violet-800">{rubric.booleanQuery}</code>
+          {(rubric.excludeKeywords ?? []).length > 0 && <p className="mt-1 text-xs text-slate-500">Excludes: {rubric.excludeKeywords.join(", ")}</p>}
+        </div>
+      )}
       {(rubric.searchVariants ?? []).length > 0 && (
         <div>
           <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Resdex search plan</div>

@@ -63,6 +63,18 @@ export const RubricZ = z.object({
   targetTitles: strArr(), // alternate designations to look for
   searchVariants: z.array(z.object({ label: z.string(), keywords: z.string() })).default([]),
   coreKeywords: z.array(z.string()),
+
+  /* ── Resdex search parameters (added later: every field has a default so rubrics already stored in
+   *    Job.parsedRubricJson keep parsing — old rows simply get ""/[]/-1 and the UI falls back to the legacy fields). ── */
+  /** Resdex-compatible Boolean string: (core AND ...) with OR-ed aliases and NOT-ed false positives. ≤ MAX_BOOLEAN_CHARS. */
+  booleanQuery: z.string().default(""),
+  /** The 3–5 non-negotiable skills the Boolean query is built around. */
+  mustHaveKeywords: strArr(),
+  /** Negative keywords that remove false positives (also used as the NOT clause). */
+  excludeKeywords: strArr(),
+  /** Experience range for the Resdex min/max fields. -1 = not stated. Mirrors min/maxExperienceYears (see resdexSearchParams). */
+  minExp: z.number().default(-1),
+  maxExp: z.number().default(-1),
 });
 export type Rubric = z.infer<typeof RubricZ>;
 
@@ -93,6 +105,11 @@ export const RubricJSON = obj({
   targetTitles: arr(str),
   searchVariants: arr(obj({ label: str, keywords: str })),
   coreKeywords: arr(str),
+  booleanQuery: str,
+  mustHaveKeywords: arr(str),
+  excludeKeywords: arr(str),
+  minExp: num,
+  maxExp: num,
 });
 
 /* ─────────────── Batch card scoring ───────────────
@@ -108,6 +125,12 @@ export const CardFactsZ = z.object({
   currentCtcLpa: z.number(),
   expectedCtcLpa: z.number(),
   location: z.string(),
+  // Card-level identity/metadata (used for "Save Card to Shortlist" without opening the profile)
+  fullName: z.string(),
+  currentRole: z.string(),
+  currentCompany: z.string(),
+  headline: z.string(),
+  skills: z.array(z.string()),
   oneLineVerdict: z.string(),
 });
 export const BatchOutZ = z.object({ results: z.array(CardFactsZ) });
@@ -123,6 +146,11 @@ export const BatchJSON = obj({
       currentCtcLpa: num,
       expectedCtcLpa: num,
       location: str,
+      fullName: str,
+      currentRole: str,
+      currentCompany: str,
+      headline: str,
+      skills: arr(str),
       oneLineVerdict: str,
     }),
   ),
@@ -234,10 +262,31 @@ export const ScoreProfileBody = z.object({
   profileUrl: z.string().max(2000).optional(),
 });
 
+/** Facts + score read off a Resdex SEARCH-RESULT CARD (no profile opened → no CV-view quota spent, no email/phone). */
+export const CardImportZ = z.object({
+  fullName: z.string().max(200).default(""),
+  currentRole: z.string().max(300).default(""),
+  currentCompany: z.string().max(300).default(""),
+  totalExp: z.number().nullable().optional(), // years; null/-1 = unknown
+  currentCtc: z.number().nullable().optional(), // LPA
+  expectedCtc: z.number().nullable().optional(), // LPA
+  noticePeriod: z.string().max(100).default(""),
+  location: z.string().max(200).default(""),
+  naukriProfileUrl: z.string().max(2000).optional(),
+  rawProfileText: z.string().max(2500), // visible card text only (guardrail: ≤ 2,500 chars)
+  aiScore: z.number().min(0).max(100),
+  matchedSkills: z.array(z.string().max(100)).max(50).default([]),
+  missingSkills: z.array(z.string().max(100)).max(50).default([]),
+  verdict: z.string().max(500).default(""),
+});
+export type CardImport = z.infer<typeof CardImportZ>;
+
 export const ImportCandidateBody = z.object({
   jobId: z.string().min(1),
   profileUrl: z.string().max(2000).optional(),
   rawText: z.string().max(20000).optional(),
   /** The audit previously returned by /score-profile. If omitted the server audits rawText itself. */
   audit: AuditZ.optional(),
+  /** Card-level save: stored as SHORTLISTED with no LLM call; later merged when the full profile is imported. */
+  card: CardImportZ.optional(),
 });

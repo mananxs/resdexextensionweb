@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { buildBooleanQuery, isBalanced, MAX_BOOLEAN_CHARS } from "@/lib/resdexQuery";
 import { REMOTE, SENIORITY, type Rubric } from "@/lib/schemas";
 
 /** Chip input: Enter / comma adds, ✕ or Backspace removes. */
@@ -87,10 +88,10 @@ export default function RubricEditor({ rubric, onChange }: { rubric: Rubric; onC
 
       <div className="grid grid-cols-2 gap-3">
         <Field label="Min experience">
-          <Num value={rubric.minExperienceYears} onChange={(n) => set("minExperienceYears", n)} placeholder="Any" suffix="yrs" />
+          <Num value={rubric.minExperienceYears} onChange={(n) => onChange({ ...rubric, minExperienceYears: n, minExp: n })} placeholder="Any" suffix="yrs" />
         </Field>
         <Field label="Max experience">
-          <Num value={rubric.maxExperienceYears} onChange={(n) => set("maxExperienceYears", n)} placeholder="Open" suffix="yrs" />
+          <Num value={rubric.maxExperienceYears} onChange={(n) => onChange({ ...rubric, maxExperienceYears: n, maxExp: n })} placeholder="Open" suffix="yrs" />
         </Field>
         <Field label="Max notice period" hint="0 = immediate">
           <Num value={rubric.maxNoticePeriodDays} onChange={(n) => set("maxNoticePeriodDays", n)} placeholder="Any" suffix="days" />
@@ -169,6 +170,26 @@ export default function RubricEditor({ rubric, onChange }: { rubric: Rubric; onC
       <Field label="Domain context">
         <textarea className="input h-16 resize-none" value={rubric.domainContext} onChange={(e) => set("domainContext", e.target.value)} />
       </Field>
+      <div className="space-y-3 rounded-lg border border-violet-200 bg-violet-50/50 p-3">
+        <div className="text-xs font-semibold text-violet-800">Resdex Boolean query <span className="font-normal text-violet-500">— pasted into the Resdex keyword box by the extension; you still press Search</span></div>
+        <Field label="Boolean query" hint={`${rubric.booleanQuery.length}/${MAX_BOOLEAN_CHARS} chars`}>
+          <textarea
+            className={`input h-20 resize-none font-mono text-xs ${rubric.booleanQuery.length > MAX_BOOLEAN_CHARS || !isBalanced(rubric.booleanQuery) ? "border-rose-400" : ""}`}
+            value={rubric.booleanQuery}
+            onChange={(e) => set("booleanQuery", e.target.value)}
+            placeholder='(React OR ReactJS) AND (Node.js OR NodeJS) NOT (Intern OR Trainee)'
+          />
+        </Field>
+        <button type="button" className="text-xs font-medium text-violet-700 hover:underline" onClick={() => set("booleanQuery", buildBooleanQuery(rubric))}>
+          ↻ Rebuild from keywords
+        </button>
+        <Field label="Must-have keywords" hint="3–5 non-negotiables">
+          <TagInput value={rubric.mustHaveKeywords} onChange={(v) => set("mustHaveKeywords", v)} tone="bg-violet-100 text-violet-800" placeholder="Add keyword…" />
+        </Field>
+        <Field label="Exclude keywords" hint="become the NOT clause">
+          <TagInput value={rubric.excludeKeywords} onChange={(v) => set("excludeKeywords", v)} tone="bg-rose-50 text-rose-700" placeholder="Add negative keyword…" />
+        </Field>
+      </div>
       <div className="rounded-lg border border-violet-200 bg-violet-50/50 p-3">
         <div className="mb-2 text-xs font-semibold text-violet-800">Resdex search plan <span className="font-normal text-violet-500">— plain keywords, no Boolean</span></div>
         <div className="space-y-2">

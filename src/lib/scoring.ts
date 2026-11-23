@@ -170,12 +170,17 @@ export function numericFits(r: Rubric, f: Facts): NumFit[] {
 
 /* ─────────────── final score ─────────────── */
 
+/** Quota recommendation for ONE paid CV view: open = High Priority · review = Borderline (judge the card first) · skip = Save Quota. */
+export type Worth = "open" | "review" | "skip";
+
 export interface ScoreResult {
   score: number;
   matched: string[];
   missing: string[];
   flags: string[];
   numeric: NumFit[];
+  worth: Worth;
+  worthReasons: string[];
 }
 
 const lvl = (n: number) => (n >= 2 ? 2 : n >= 1 ? 1 : 0);
@@ -193,6 +198,8 @@ export function computeScore(r: Rubric, criteria: Criterion[], levels: number[],
   const matched: string[] = [];
   const missing: string[] = [];
   const flags: string[] = [];
+  const mustAbsent: string[] = []; // must-have skills with NO evidence
+  const mustPartial: string[] = [];
   let dealBreaker = false;
 
   criteria.forEach((c, i) => {
@@ -210,6 +217,8 @@ export function computeScore(r: Rubric, criteria: Criterion[], levels: number[],
     if (c.tier === "must") {
       mustNum += c.weight * credit;
       mustDen += c.weight;
+      if (c.kind === "skill" && l === 0) mustAbsent.push(c.name);
+      else if (c.kind === "skill" && l === 1) mustPartial.push(c.name);
     }
     if (c.kind === "skill") {
       if (l === 2) matched.push(c.name);
@@ -252,7 +261,71 @@ export function computeScore(r: Rubric, criteria: Criterion[], levels: number[],
   if (notice && notice.known && notice.credit <= 0.1) score = Math.min(score, 70); // 30+ days beyond the limit
   if (dealBreaker) score = Math.min(score, 30);
 
-  return { score: Math.max(0, Math.min(100, Math.round(score))), matched, missing, flags, numeric };
+  const finalScore = Math.max(0, Math.min(100, Math.round(score)));
+  const { worth, reasons } = decideWorth(r, numeric, { score: finalScore, cov, mustAbsent, mustPartial, dealBreaker, flags, facts });
+  return { score: finalScore, matched, missing, flags, numeric, worth, worthReasons: reasons };
+}
+
+interface WorthInput {
+  score: number;
+  cov: number; // weighted must-have coverage 0..1
+  mustAbsent: string[];
+  mustPartial: string[];
+  dealBreaker: boolean;
+  flags: string[];
+  facts: Facts;
+}
+
+/**
+ * Should the recruiter spend 1 paid CV view on this candidate? Decided ONLY from card-level evidence.
+ *  skip   – deal-breaker, most must-haves missing, a known number outside the JD's bounds (experience / notice / CTC), or a very low score
+ *  open   – strong score + (almost) full must-have coverage + every bound the JD sets is VISIBLE on the card and satisfied
+ *  review – everything in between: partial skills, missing key metadata (notice/CTC/experience hidden), location mismatch
+ */
+function decideWorth(r: Rubric, numeric: NumFit[], w: WorthInput): { worth: Worth; reasons: string[] } {
+  const byKey = (k: NumFit["key"]) => numeric.find((n) => n.key === k);
+  const exp = byKey("experience");
+  const notice = byKey("notice");
+  const ctc = byKey("ctc");
+  const loc = byKey("location");
+
+  const outOfBounds: string[] = [];
+  if (exp?.known && exp.credit <= 0.35) outOfBounds.push(`Experience ${w.facts.expYears} yrs outside ${exp.label.replace("Experience ", "")}`);
+  if (notice?.known && r.maxNoticePeriodDays >= 0 && notice.credit <= 0.35) outOfBounds.push(`Notice ${w.facts.noticeDays}d > ${r.maxNoticePeriodDays}d limit`);
+  if (ctc?.known && ctc.credit <= 0.35) outOfBounds.push(`CTC above budget (${ctc.evidence})`);
+
+  const hasMustSkills = r.mustHaveSkills.length > 0;
+  if (w.dealBreaker) return { worth: "skip", reasons: w.flags.filter((f) => f.startsWith("Deal-breaker")).slice(0, 2) };
+  if ((hasMustSkills && w.cov < 0.5) || outOfBounds.length || w.score < 35) {
+    const reasons: string[] = [];
+    if (hasMustSkills && w.cov < 0.5) reasons.push(`Missing must-have: ${[...w.mustAbsent, ...w.mustPartial].slice(0, 3).join(", ") || "core skills"}`);
+    reasons.push(...outOfBounds);
+    if (!reasons.length) reasons.push("Low overall match");
+    return { worth: "skip", reasons: reasons.slice(0, 3) };
+  }
+
+  // Key metadata the JD constrains but the card doesn't show → can't confirm → borderline.
+  const unseen: string[] = [];
+  if (exp && !exp.known) unseen.push("Experience not shown");
+  if (notice && r.maxNoticePeriodDays >= 0 && !notice.known) unseen.push("Notice period not shown");
+  if (ctc && !ctc.known) unseen.push("CTC not shown");
+
+  const strong =
+    w.score >= 75 &&
+    (!hasMustSkills || (w.cov >= 0.85 && w.mustAbsent.length === 0)) &&
+    unseen.length === 0 &&
+    [exp, notice && r.maxNoticePeriodDays >= 0 ? notice : undefined, ctc].every((n) => !n || n.credit >= 0.6) &&
+    !(loc?.known && loc.credit < 0.6);
+  if (strong) return { worth: "open", reasons: ["Strong match, within experience / notice / CTC bounds"] };
+
+  const reasons: string[] = [];
+  if (w.mustAbsent.length) reasons.push(`Missing: ${w.mustAbsent.slice(0, 3).join(", ")}`);
+  if (w.mustPartial.length) reasons.push(`Partial: ${w.mustPartial.slice(0, 3).join(", ")}`);
+  reasons.push(...unseen);
+  if (loc?.known && loc.credit < 0.6) reasons.push(`Location: ${w.facts.location}`);
+  for (const n of [exp, notice, ctc]) if (n?.known && n.credit < 0.6 && n.credit > 0.35) reasons.push(`${n.label}: ${n.evidence}`);
+  if (!reasons.length) reasons.push("Decent match — check the card before spending a view");
+  return { worth: "review", reasons: reasons.slice(0, 3) };
 }
 
 export function fitOf(n?: { known: boolean; credit: number }): "good" | "ok" | "risk" | "unknown" {

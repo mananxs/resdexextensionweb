@@ -1,7 +1,8 @@
 import Groq from "groq-sdk";
 import type { ZodType, ZodTypeDef } from "zod";
 import { AuditJSON, AuditLLMZ, BatchJSON, BatchOutZ, RubricJSON, RubricZ, type Audit, type Rubric } from "./schemas";
-import { buildCriteria, computeScore, ctcString, fitOf, type Criterion, type Facts } from "./scoring";
+import { buildBooleanQuery, sanitizeBooleanQuery, MAX_BOOLEAN_CHARS } from "./resdexQuery";
+import { buildCriteria, computeScore, ctcString, fitOf, type Criterion, type Facts, type Worth } from "./scoring";
 import { tierFor } from "./tier";
 
 export const MODELS = {
@@ -100,6 +101,14 @@ Fields:
     "Wide"     = alternate title/synonym + 1–2 key skills (large pool for recall)
   Prefer terms that appear on real profiles; skip ubiquitous skills (Git, Agile, MS Office) and soft skills.
 - coreKeywords: 3–5 short single keywords/titles (same spirit, no operators).
+- RESDEX SEARCH PARAMETERS (used to pre-fill the Naukri Resdex search form; they are NOT scoring inputs):
+    mustHaveKeywords: the 3–5 NON-NEGOTIABLE skills/titles (subset of mustHaveSkills, scarcest first). Short canonical terms.
+    excludeKeywords: 0–5 negative keywords that remove false positives for THIS role (e.g. "Manual Testing" for an automation role, "Intern", "Trainee"). Only terms that would never appear on a good profile. [] if unsure — do NOT invent.
+    booleanQuery: ONE Resdex-compatible Boolean string, ≤ ${MAX_BOOLEAN_CHARS} characters:
+      • join the mustHaveKeywords with AND; wrap each skill with its 1–3 strongest synonyms/aliases in parentheses joined by OR, e.g. (React OR ReactJS OR "React.js") AND (Node.js OR NodeJS) AND AWS
+      • append the excludeKeywords as NOT (x OR y)
+      • double-quote multi-word terms; uppercase AND/OR/NOT; balanced parentheses; no experience, salary, notice or location words in the string.
+    minExp / maxExp: overall experience range in years for the Resdex min/max boxes (same meaning as minExperienceYears/maxExperienceYears; -1 if not stated).
 Use -1 for any unstated number, "" for unstated strings, [] for unstated lists.`.trim();
 
 export async function extractRubric(rawJd: string): Promise<Rubric> {
@@ -163,8 +172,29 @@ function normalizeRubric(r: Rubric): Rubric {
     .filter((v) => v.keywords)
     .slice(0, 3);
   const core = dedupe(r.coreKeywords.map(cleanKw).filter(Boolean), 5);
+
+  // ── Resdex search parameters ──
+  const mustLc = new Set(must.map((s) => s.toLowerCase()));
+  let mustKw = dedupe(r.mustHaveKeywords.map((s) => s.replace(/["()]/g, " ").replace(/\s+/g, " ").trim()).filter(Boolean), 5);
+  if (mustKw.length < 3) mustKw = dedupe([...mustKw, ...must], 5); // top up from the must-have skills
+  const exclude = dedupe(
+    r.excludeKeywords.map((s) => s.replace(/["()]/g, " ").replace(/\s+/g, " ").trim()).filter((s) => s && !mustLc.has(s.toLowerCase()) && !mustKw.some((m) => m.toLowerCase() === s.toLowerCase())),
+    5,
+  );
+  const aliases = r.skillAliases.filter((x) => x.skill && x.aliases.length).map((x) => ({ skill: x.skill, aliases: dedupe(x.aliases, 6) }));
+  // Trust the model's query only if it is balanced, short enough and not truncated; otherwise rebuild deterministically.
+  const booleanQuery =
+    sanitizeBooleanQuery(r.booleanQuery) || buildBooleanQuery({ mustHaveSkills: must, mustHaveKeywords: mustKw, excludeKeywords: exclude, skillAliases: aliases });
+  const minExp = r.minExp >= 0 ? r.minExp : r.minExperienceYears;
+  const maxExp = r.maxExp >= 0 ? r.maxExp : r.maxExperienceYears;
+
   return {
     ...r,
+    booleanQuery,
+    mustHaveKeywords: mustKw,
+    excludeKeywords: exclude,
+    minExp,
+    maxExp,
     mustHaveSkills: must,
     importantSkills: important,
     niceToHaveSkills: nice,
@@ -196,6 +226,21 @@ export interface ScoredCard {
   domId: string;
   score: number;
   tier: string;
+  /** "Worth 1 CV View" recommendation: open = High Priority · review = Borderline · skip = Save Quota */
+  worth: Worth;
+  worthReasons: string[];
+  /** Facts read off the card itself — lets the extension save a card without opening the profile. */
+  extracted: {
+    fullName: string;
+    currentRole: string;
+    currentCompany: string;
+    headline: string;
+    skills: string[];
+    expYears: number;
+    currentCtcLpa: number;
+    expectedCtcLpa: number;
+    location: string;
+  };
   matchedSkills: string[];
   missingSkills: string[];
   noticePeriod: string;
@@ -218,14 +263,15 @@ export async function scoreBatch(
     name: "batch_candidate_facts",
     jsonSchema: BatchJSON,
     zod: BatchOutZ,
-    maxTokens: Math.min(8000, 260 * cards.length + 600),
+    maxTokens: Math.min(10000, 400 * cards.length + 600),
     effort: "low",
     system: `${INDIA_RULES}
 
 TASK: For EVERY candidate card (echo its domId verbatim) do two things:
-A) Extract FACTS: expYears, noticePeriod text + noticeDays, currentCtcLpa, expectedCtcLpa, location (-1 / "" if absent).
+A) Extract FACTS from EVERY visible field of the card — fullName, currentRole (current designation), currentCompany, headline (profile headline / one-line summary, ≤ 25 words, "" if none),
+   skills (the key skills visibly listed, ≤ 12, as written), expYears, noticePeriod text + noticeDays, currentCtcLpa, expectedCtcLpa, location (-1 / "" if absent). Copy names/roles/companies verbatim; never guess.
 B) Rate each criterion below. "levels" must contain EXACTLY ${N} integers, in criterion order (index 0..${N - 1}). ${LEVEL_RULES}
-Cards are short snippets: judge from skills lists, designation, company, summary and any keyword text present.
+Cards are short snippets: judge from the skills list, designation, company, headline, summary, experience, CTC, notice period and location together — a skill only in a "preferred" list is weaker than one in the current designation or summary.
 Also give oneLineVerdict (≤ 18 words, name the strongest match and the biggest gap; do NOT state a numeric score).
 
 CRITERIA:
@@ -252,6 +298,19 @@ ${criteriaBlock(criteria)}`,
       domId: r.domId,
       score: s.score,
       tier: tierFor(s.score),
+      worth: s.worth,
+      worthReasons: s.worthReasons,
+      extracted: {
+        fullName: r.fullName.trim(),
+        currentRole: r.currentRole.trim(),
+        currentCompany: r.currentCompany.trim(),
+        headline: r.headline.trim(),
+        skills: r.skills.slice(0, 12),
+        expYears: facts.expYears,
+        currentCtcLpa: facts.currentCtcLpa,
+        expectedCtcLpa: facts.expectedCtcLpa,
+        location: r.location.trim(),
+      },
       matchedSkills: s.matched.slice(0, 6),
       missingSkills: s.missing.slice(0, 6),
       noticePeriod: r.noticePeriod || "Not mentioned",

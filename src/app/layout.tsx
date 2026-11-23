@@ -21,6 +21,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               <Link href="/jobs" className="rounded-md px-3 py-1.5 text-slate-600 hover:bg-slate-100">
                 Jobs
               </Link>
+              <Link href="/candidates" className="rounded-md px-3 py-1.5 text-slate-600 hover:bg-slate-100">
+                Candidates
+              </Link>
               <Link href="/extension-setup" className="rounded-md px-3 py-1.5 text-slate-600 hover:bg-slate-100">
                 Extension setup
               </Link>

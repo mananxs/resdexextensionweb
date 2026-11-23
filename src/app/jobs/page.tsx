@@ -1,4 +1,5 @@
 import Link from "next/link";
+import DeleteJobButton from "@/components/DeleteJobButton";
 import NewJobModal from "@/components/NewJobModal";
 import { prisma } from "@/lib/prisma";
 import { RubricZ } from "@/lib/schemas";
@@ -52,26 +53,33 @@ export default async function JobsPage() {
             const rubric = RubricZ.safeParse(j.parsedRubricJson).data;
             const top = j.candidates.reduce((m, c) => Math.max(m, c.aiScore), 0);
             return (
-              <Link key={j.id} href={`/jobs/${j.id}`} className="card block p-5 transition hover:-translate-y-1 hover:border-indigo-300 hover:shadow-lg">
-                <div className="flex items-start justify-between gap-2">
-                  <h2 className="font-semibold leading-snug">{j.title}</h2>
-                  <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">{j.status}</span>
+              <div key={j.id} className="card flex flex-col transition hover:-translate-y-1 hover:border-indigo-300 hover:shadow-lg">
+                <Link href={`/jobs/${j.id}`} className="block flex-1 p-5">
+                  <div className="flex items-start justify-between gap-2">
+                    <h2 className="font-semibold leading-snug">{j.title}</h2>
+                    <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">{j.status}</span>
+                  </div>
+                  <p className="mt-1 text-xs text-slate-500">{[j.department, j.location].filter(Boolean).join(" · ") || "—"}</p>
+                  <div className="mt-3 flex flex-wrap gap-1">
+                    {rubric?.mustHaveSkills.slice(0, 5).map((s) => (
+                      <span key={s} className="rounded bg-indigo-50 px-1.5 py-0.5 text-[11px] text-indigo-700">
+                        {s}
+                      </span>
+                    ))}
+                  </div>
+                </Link>
+                <div className="flex items-center justify-between gap-2 border-t border-slate-100 px-5 py-3 text-sm">
+                  <Link href={`/candidates?job=${j.id}&all=1`} className="text-slate-600 hover:text-indigo-600">
+                    {j.candidates.length} shortlisted · <span className="font-medium text-indigo-600">Candidates →</span>
+                  </Link>
+                  <span className="flex items-center gap-3">
+                    {j.candidates.length > 0 && (
+                      <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ring-1 ring-inset ${tierClasses(top)}`}>Top {top}%</span>
+                    )}
+                    <DeleteJobButton id={j.id} title={j.title} count={j.candidates.length} compact />
+                  </span>
                 </div>
-                <p className="mt-1 text-xs text-slate-500">{[j.department, j.location].filter(Boolean).join(" · ") || "—"}</p>
-                <div className="mt-3 flex flex-wrap gap-1">
-                  {rubric?.mustHaveSkills.slice(0, 5).map((s) => (
-                    <span key={s} className="rounded bg-indigo-50 px-1.5 py-0.5 text-[11px] text-indigo-700">
-                      {s}
-                    </span>
-                  ))}
-                </div>
-                <div className="mt-4 flex items-center justify-between border-t border-slate-100 pt-3 text-sm">
-                  <span className="text-slate-600">{j.candidates.length} shortlisted</span>
-                  {j.candidates.length > 0 && (
-                    <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ring-1 ring-inset ${tierClasses(top)}`}>Top {top}%</span>
-                  )}
-                </div>
-              </Link>
+              </div>
             );
           })}
         </div>
