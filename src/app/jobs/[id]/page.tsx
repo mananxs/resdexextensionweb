@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import EditJobButton from "@/components/EditJobButton";
 import DeleteJobButton from "@/components/DeleteJobButton";
 import CandidateBoard from "@/components/CandidateBoard";
 import RubricPills from "@/components/RubricPills";
@@ -38,6 +39,9 @@ export default async function JobPage({ params }: { params: Promise<{ id: string
             <Link href={`/candidates?job=${job.id}&all=1`} className="btn-ghost">
               Candidates
             </Link>
+            {rubric && (
+              <EditJobButton job={{ id: job.id, title: job.title, department: job.department ?? "", location: job.location ?? "", status: job.status }} rubric={rubric} />
+            )}
             <DeleteJobButton id={job.id} title={job.title} count={candidates.length} redirectTo="/jobs" />
           </div>
         </div>
