@@ -2,6 +2,9 @@ import type { Candidate, Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import type { Audit, CardImport } from "./schemas";
 import { tierFor } from "./tier";
+import { normalizeUrl } from "./keys";
+
+export { normalizeUrl };
 
 /**
  * One place that decides how a candidate is created / deduplicated / merged inside a job.
@@ -23,17 +26,6 @@ import { tierFor } from "./tier";
 const pos = (n: number | null | undefined) => (typeof n === "number" && Number.isFinite(n) && n >= 0 ? n : null);
 export const clean = (s: string | null | undefined) => (s && s.trim() ? s.trim() : null);
 const norm = (s: string | null | undefined) => (s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-
-/** Strip query/hash so the same profile opened from different Resdex views dedupes. */
-export function normalizeUrl(u?: string | null) {
-  if (!u) return null;
-  try {
-    const url = new URL(u);
-    return `${url.origin}${url.pathname}`.replace(/\/$/, "");
-  } catch {
-    return u.trim() || null;
-  }
-}
 
 export interface UpsertResult {
   candidate: Candidate;
@@ -93,6 +85,8 @@ function fullData(audit: Audit & { tier?: string }, rawText: string | null | und
     auditJson: {
       strengths: audit.strengths,
       risks: audit.risks,
+      gaps: audit.gaps ?? [],
+      breakdown: audit.breakdown ?? null,
       noticeFit: audit.noticeFit,
       noticeNote: audit.noticeNote,
       ctcFit: audit.ctcFit,
@@ -106,21 +100,29 @@ function fullData(audit: Audit & { tier?: string }, rawText: string | null | und
 
 /** Full-profile import: Resdex profile (extension) or an uploaded resume (dashboard). */
 export async function upsertFullCandidate(args: {
+  /** Owner — used to verify the résumé being linked belongs to the same HR. */
+  userId: string;
   jobId: string;
   audit: Audit & { tier?: string };
   rawText?: string | null;
   profileUrl?: string | null;
   fallbackName?: string;
-  /** Original uploaded file (dashboard uploads). Replaces any previously stored resume for the candidate. */
-  resume?: { name: string; mime: string; data: Uint8Array<ArrayBuffer> };
+  /** Rubric hash the score was computed with (lets the UI flag scores made under an older rubric). */
+  rubricHash?: string;
+  /** A stored Resume row (lib/resumes.ts) to link to this candidate. */
+  resumeId?: string;
 }): Promise<UpsertResult> {
-  const resumeCols = args.resume ? { resumeName: args.resume.name.slice(0, 200), resumeMime: args.resume.mime || "application/octet-stream", resumeData: args.resume.data } : {};
   const url = normalizeUrl(args.profileUrl);
-  const data = fullData(args.audit, args.rawText, url, args.fallbackName);
+  const data = { ...fullData(args.audit, args.rawText, url, args.fallbackName), scoredRubricHash: args.rubricHash ?? null };
+  const linkResume = async (candidateId: string) => {
+    if (!args.resumeId) return;
+    await prisma.resume.updateMany({ where: { id: args.resumeId, userId: args.userId }, data: { candidateId, jobId: args.jobId } });
+  };
   const existing = await findExisting(args.jobId, { email: data.email, phone: data.phone, url, name: data.fullName, company: data.currentCompany, exp: data.totalExp });
 
   if (!existing) {
-    const created = await prisma.candidate.create({ data: { ...data, ...resumeCols, jobId: args.jobId } });
+    const created = await prisma.candidate.create({ data: { ...data, jobId: args.jobId } });
+    await linkResume(created.id);
     return { candidate: created, duplicate: false, upgradedFromCard: false };
   }
   const wasCard = existing.auditJson === null;
@@ -140,15 +142,15 @@ export async function upsertFullCandidate(args: {
       email: data.email ?? existing.email,
       phone: data.phone ?? existing.phone,
       naukriProfileUrl: data.naukriProfileUrl ?? existing.naukriProfileUrl,
-      ...resumeCols,
       // status intentionally untouched → pipeline stage survives re-imports / card→full upgrades
     },
   });
+  await linkResume(merged.id);
   return { candidate: merged, duplicate: true, upgradedFromCard: wasCard };
 }
 
 /** Card-level import: no LLM call, no email/phone, status SHORTLISTED (column default). */
-export async function upsertCardCandidate(args: { jobId: string; card: CardImport }): Promise<UpsertResult & { skippedBecauseFull: boolean }> {
+export async function upsertCardCandidate(args: { jobId: string; card: CardImport; rubricHash?: string }): Promise<UpsertResult & { skippedBecauseFull: boolean }> {
   const c = args.card;
   const url = normalizeUrl(c.naukriProfileUrl);
   const score = Math.max(0, Math.min(100, Math.round(c.aiScore)));
@@ -168,6 +170,7 @@ export async function upsertCardCandidate(args: { jobId: string; card: CardImpor
     matchedSkills: c.matchedSkills,
     missingSkills: c.missingSkills,
     aiVerdict: clean(c.verdict) ?? "Card-level screening only — profile not opened yet.",
+    scoredRubricHash: args.rubricHash ?? null,
   };
   const existing = await findExisting(args.jobId, { email: null, phone: null, url, name: data.fullName, company: data.currentCompany, exp: data.totalExp });
 

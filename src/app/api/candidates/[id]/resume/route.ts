@@ -1,27 +1,28 @@
 import { NextResponse } from "next/server";
+import { handleDash } from "@/lib/http";
+import { HttpError } from "@/lib/errors";
 import { prisma } from "@/lib/prisma";
-import { getCurrentUser } from "@/lib/user";
+import { fileResponse } from "@/lib/resumeResponse";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** Streams the stored resume of one of the current user's candidates as a download. */
-export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> }) {
-  const { id } = await ctx.params;
-  const user = await getCurrentUser();
-  const c = await prisma.candidate.findFirst({
-    where: { id, job: { userId: user.id } },
-    select: { resumeName: true, resumeMime: true, resumeData: true },
-  });
-  if (!c?.resumeData || !c.resumeName) return NextResponse.json({ error: "No resume stored for this candidate" }, { status: 404 });
-  const safe = c.resumeName.replace(/[^\w.\- ]+/g, "_");
-  return new NextResponse(c.resumeData, {
-    headers: {
-      "Content-Type": c.resumeMime ?? "application/octet-stream",
-      "Content-Disposition": `attachment; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(c.resumeName)}`,
-      "Content-Length": String(c.resumeData.byteLength),
-      "X-Content-Type-Options": "nosniff",
-      "Cache-Control": "private, no-store",
-    },
+/**
+ * Streams the stored résumé of one of the current HR's candidates (`?inline=1` to view PDFs in the browser).
+ * Prefers the independent Resume table; falls back to the legacy inline columns of candidates uploaded before it existed.
+ */
+export function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
+  return handleDash(req, async (user) => {
+    const { id } = await ctx.params;
+    const inline = new URL(req.url).searchParams.get("inline") === "1";
+    const cand = await prisma.candidate.findFirst({
+      where: { id, job: { userId: user.id } },
+      select: { resumeName: true, resumeMime: true, resumeData: true, resumes: { where: { userId: user.id }, orderBy: { createdAt: "desc" }, take: 1, select: { fileName: true, mimeType: true, data: true } } },
+    });
+    if (!cand) throw new HttpError(404, "Not found");
+    const r = cand.resumes[0];
+    if (r) return fileResponse(r.fileName, r.mimeType, r.data, inline);
+    if (cand.resumeData && cand.resumeName) return fileResponse(cand.resumeName, cand.resumeMime ?? "application/octet-stream", cand.resumeData, inline);
+    return NextResponse.json({ error: "No resume stored for this candidate" }, { status: 404 });
   });
 }

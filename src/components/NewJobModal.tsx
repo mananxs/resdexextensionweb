@@ -130,7 +130,7 @@ export default function NewJobModal() {
             <div className="flex items-center justify-between bg-gradient-to-r from-indigo-600 to-violet-600 px-6 py-4 text-white">
               <div>
                 <h2 className="text-lg font-semibold">New job</h2>
-                <p className="text-xs text-indigo-100">Upload or paste a JD — Groq fills the fields, you fine-tune them.</p>
+                <p className="text-xs text-indigo-100">Upload or paste a JD — AI fills the fields, you fine-tune them.</p>
               </div>
               <div className="flex items-center gap-4">
                 <ol className="hidden items-center gap-2 text-xs sm:flex">
@@ -178,7 +178,7 @@ export default function NewJobModal() {
                     <input ref={fileRef} type="file" accept={ACCEPT} hidden onChange={(e) => e.target.files?.[0] && void analyzeFile(e.target.files[0])} />
                     <div className="mb-2 text-4xl">{busy === "analyze" ? <span className="inline-block animate-spin">⚙️</span> : fileName ? "✅" : "⬆️"}</div>
                     <p className="font-medium text-slate-700">{busy === "analyze" ? `Reading ${fileName || "file"} & analyzing…` : fileName ? fileName : "Drop a JD here or click to browse"}</p>
-                    <p className="mt-1 text-xs text-slate-500">PDF, DOCX or TXT · up to 5 MB</p>
+                    <p className="mt-1 text-xs text-slate-500">PDF, DOCX or TXT · up to 4 MB</p>
                   </div>
                 )}
 
@@ -195,7 +195,7 @@ export default function NewJobModal() {
                       onChange={(e) => setJd(e.target.value)}
                     />
                     <button className="btn-primary w-full" disabled={busy !== null || jd.trim().length < 40} onClick={analyzeText}>
-                      {busy === "analyze" ? "Analyzing with Groq…" : rubric ? (stale ? "✨ Re-analyze edited text" : "↻ Re-analyze") : "✨ Analyze JD with Groq"}
+                      {busy === "analyze" ? "Analyzing with AI…" : rubric ? (stale ? "✨ Re-analyze edited text" : "↻ Re-analyze") : "✨ Analyze JD with AI"}
                     </button>
                   </div>
                 )}
@@ -216,7 +216,7 @@ export default function NewJobModal() {
                     {[100, 85, 95, 60, 90, 75].map((w, i) => (
                       <div key={i} className="h-9 animate-pulse rounded-lg bg-slate-200" style={{ width: `${w}%`, animationDelay: `${i * 90}ms` }} />
                     ))}
-                    <p className="text-center text-xs text-slate-500">Groq is extracting skills, experience, notice period, CTC & location…</p>
+                    <p className="text-center text-xs text-slate-500">The AI is extracting skills, experience, notice period, CTC & location…</p>
                   </div>
                 ) : rubric ? (
                   <div className="space-y-4 animate-fade">

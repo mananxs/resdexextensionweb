@@ -3,7 +3,7 @@
 import { useCallback, useRef, useState } from "react";
 import type { CandidateDTO } from "@/lib/types";
 
-const MAX_BYTES = 5 * 1024 * 1024;
+const MAX_BYTES = 4 * 1024 * 1024; // Vercel rejects request bodies above ~4.5 MB
 const OK_EXT = /\.(pdf|docx)$/i;
 
 type Status = "queued" | "uploading" | "analyzing" | "done" | "error";
@@ -20,11 +20,13 @@ interface ApiFileResult {
   error?: string;
   duplicate?: boolean;
   upgradedFromCard?: boolean;
+  cached?: boolean;
+  resume?: { id: string };
   candidate?: CandidateDTO;
 }
 
 /** POST one file with real upload progress (fetch can't report it). The server then spends 10–20 s auditing → "analyzing". */
-function uploadOne(jobId: string, file: File, onProgress: (pct: number) => void, onSent: () => void): Promise<ApiFileResult> {
+function uploadOne(jobId: string, file: File, storeOnly: boolean, onProgress: (pct: number) => void, onSent: () => void): Promise<ApiFileResult> {
   return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `/api/jobs/${jobId}/candidates/upload`);
@@ -40,6 +42,7 @@ function uploadOne(jobId: string, file: File, onProgress: (pct: number) => void,
     };
     const fd = new FormData();
     fd.append("file", file);
+    if (storeOnly) fd.append("score", "0");
     xhr.send(fd);
   });
 }
@@ -50,46 +53,52 @@ export default function ResumeUploader({ jobId, onCandidate }: { jobId: string; 
   const [running, setRunning] = useState(false);
   const input = useRef<HTMLInputElement>(null);
   const nextId = useRef(1);
+  const [storeOnly, setStoreOnly] = useState(false); // save the file(s) without scoring (no AI call)
 
   const patch = useCallback((id: number, p: Partial<Item>) => setItems((xs) => xs.map((x) => (x.id === id ? { ...x, ...p } : x))), []);
 
   const processQueue = useCallback(
     async (queue: Item[]) => {
       setRunning(true);
-      for (const it of queue) {
-        // Sequential: each resume is a full AI audit; parallel uploads would trip Groq rate limits.
-        patch(it.id, { status: "uploading", progress: 0, message: undefined });
-        const r = await uploadOne(
-          jobId,
-          it.file,
-          (progress) => patch(it.id, { progress }),
-          () => patch(it.id, { status: "analyzing", progress: 100 }),
-        );
-        if (r.ok && r.candidate) {
-          onCandidate(r.candidate);
-          patch(it.id, {
-            status: "done",
-            progress: 100,
-            message: r.upgradedFromCard
-              ? `Merged into saved card · ${r.candidate.aiScore}%`
-              : r.duplicate
-                ? `Already on board — refreshed · ${r.candidate.aiScore}%`
-                : `Added ${r.candidate.fullName} · ${r.candidate.aiScore}%`,
-          });
-        } else {
-          patch(it.id, { status: "error", message: r.error ?? "Failed" });
+      const todo = [...queue];
+      // Two files at a time: the server spreads scoring across its AI key pool, so this is safe and ~2× faster.
+      const worker = async () => {
+        for (let it = todo.shift(); it; it = todo.shift()) {
+          patch(it.id, { status: "uploading", progress: 0, message: undefined });
+          const r = await uploadOne(
+            jobId,
+            it.file,
+            storeOnly,
+            (progress) => patch(it.id, { progress }),
+            () => patch(it.id, { status: storeOnly ? "uploading" : "analyzing", progress: 100 }),
+          );
+          if (r.ok && r.candidate) {
+            onCandidate(r.candidate);
+            patch(it.id, {
+              status: "done",
+              progress: 100,
+              message:
+                (r.upgradedFromCard ? `Merged into saved card · ${r.candidate.aiScore}%` : r.duplicate ? `Already on board — refreshed · ${r.candidate.aiScore}%` : `Added ${r.candidate.fullName} · ${r.candidate.aiScore}%`) +
+                (r.cached ? " · cached (no AI call)" : ""),
+            });
+          } else if (r.ok) {
+            patch(it.id, { status: "done", progress: 100, message: r.error ?? (r.duplicate ? "Already stored — not scored" : "Stored — not scored yet (use “Score against job” below)") });
+          } else {
+            patch(it.id, { status: "error", message: r.error ?? "Failed" });
+          }
         }
-      }
+      };
+      await Promise.all([worker(), worker()]);
       setRunning(false);
     },
-    [jobId, onCandidate, patch],
+    [jobId, onCandidate, patch, storeOnly],
   );
 
   const add = useCallback(
     (list: FileList | File[]) => {
       const fresh: Item[] = [];
       for (const file of Array.from(list)) {
-        const reason = !OK_EXT.test(file.name) ? "Only PDF and DOCX files are supported" : file.size > MAX_BYTES ? "File is larger than 5 MB" : undefined;
+        const reason = !OK_EXT.test(file.name) ? "Only PDF and DOCX files are supported" : file.size > MAX_BYTES ? "File is larger than 4 MB" : undefined;
         fresh.push({ id: nextId.current++, file, status: reason ? "error" : "queued", progress: 0, message: reason });
       }
       if (!fresh.length) return;
@@ -132,7 +141,10 @@ export default function ResumeUploader({ jobId, onCandidate }: { jobId: string; 
         <button type="button" className="btn-primary" onClick={() => input.current?.click()}>
           Upload Resumes (PDF/DOCX)
         </button>
-        <span className="text-slate-500">or drop files here — each resume is read, scored against this job and added to the board (max 5 MB each).</span>
+        <span className="text-slate-500">or drop files here — each resume is stored, {storeOnly ? "kept in the library (not scored)" : "scored against this job and added to the board"} (max 4 MB each).</span>
+        <label className="flex items-center gap-1.5 text-xs text-slate-600">
+          <input type="checkbox" checked={storeOnly} onChange={(e) => setStoreOnly(e.target.checked)} /> Store only, don’t score
+        </label>
         {items.some((i) => i.status === "done" || i.status === "error") && !running && (
           <button type="button" className="ml-auto text-xs text-slate-500 hover:text-slate-900" onClick={clearFinished}>
             Clear finished
@@ -155,7 +167,7 @@ export default function ResumeUploader({ jobId, onCandidate }: { jobId: string; 
                       <div className={`h-full bg-indigo-600 transition-all ${it.status === "analyzing" ? "animate-pulse" : ""}`} style={{ width: `${it.status === "queued" ? 0 : it.progress}%` }} />
                     </div>
                     <span className="w-28 text-right text-[11px] text-slate-500">
-                      {it.status === "queued" ? "Queued" : it.status === "uploading" ? `Uploading ${it.progress}%` : "Analyzing with Groq…"}
+                      {it.status === "queued" ? "Queued" : it.status === "uploading" ? `Uploading ${it.progress}%` : "Analyzing with AI…"}
                     </span>
                   </div>
                 ) : (

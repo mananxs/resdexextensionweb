@@ -3,18 +3,46 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider  = "postgresql"
   url       = env("DATABASE_URL") // Neon pooled connection (host contains -pooler)
-  directUrl = env("DIRECT_URL") // Neon direct connection, used by prisma migrate
+  directUrl = env("DIRECT_URL") // Neon direct connection, used by prisma migrate / db push
 }
 
+/// One row per HR / recruiter. EVERYTHING below hangs off a User (directly via userId, or through Job.userId),
+/// and every query in the app filters by it — that is the multi-HR isolation boundary.
 model User {
   id              String   @id @default(cuid())
   email           String   @unique
   name            String?
   extensionApiKey String   @unique
+  /// scrypt hash "N$salt$hash" (see lib/auth.ts). Null only for legacy single-tenant rows that haven't set a password yet.
+  passwordHash    String?
+  /// The HR's OWN provider keys, AES-256-GCM encrypted (lib/crypto.ts). Comma-separated list before encryption.
+  groqKeysEnc     String?
+  geminiKeysEnc   String?
+  /// false = use ONLY the HR's own keys (never spend the shared server pool).
+  useSharedKeys   Boolean  @default(true)
   createdAt       DateTime @default(now())
-  jobs            Job[]
+
+  jobs           Job[]
+  sessions       Session[]
+  resumes        Resume[]
+  scoreCache     ScoreCache[]
+  searchSessions SearchSession[]
+}
+
+/// Dashboard login session (httpOnly cookie holds the random token; only its SHA-256 is stored).
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  userAgent String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
 }
 
 enum JobStatus {
@@ -32,9 +60,14 @@ model Job {
   location         String?
   rawDescription   String
   parsedRubricJson Json
+  /// Hash of the scoring-relevant part of the rubric. Changes when the HR edits the rubric → cached scores stop matching.
+  rubricHash       String?
   status           JobStatus   @default(ACTIVE)
   createdAt        DateTime    @default(now())
   candidates       Candidate[]
+  resumes          Resume[]
+  scoreCache       ScoreCache[]
+  searchSessions   SearchSession[]
 
   @@index([userId, createdAt])
 }
@@ -69,15 +102,109 @@ model Candidate {
   missingSkills      String[]
   aiVerdict          String
   interviewQuestions String[]
-  auditJson          Json? // strengths, risks, notice/CTC/experience fit notes
-  resumeName         String? // original file name of an uploaded resume (PDF/DOCX)
+  auditJson          Json? // strengths, risks, gaps, notes, checks, score breakdown
+  /// Rubric hash this score was computed with (null on rows created before the cache existed).
+  scoredRubricHash   String?
+  /// LEGACY inline resume columns (pre-Resume-table uploads). New uploads go to Resume; the download route still serves these.
+  resumeName         String?
   resumeMime         String?
-  resumeData         Bytes? // the file itself (≤ 5 MB); never selected in list queries
+  resumeData         Bytes?
   status             CandidateStatus @default(SHORTLISTED)
   createdAt          DateTime        @default(now())
+  resumes            Resume[]
 
   @@index([jobId, aiScore])
   @@index([jobId, email])
   @@index([jobId, phone])
   @@index([jobId, naukriProfileUrl])
+}
+
+/// Resume files, stored independently of the extension and of scoring. A resume can be:
+///   • in the HR's library only (jobId null, candidateId null) — uploaded, viewable, downloadable, searchable by text
+///   • attached to a job (jobId set) — shown on /jobs/[id] even before/without scoring
+///   • linked to a scored Candidate (candidateId set)
+/// The bytes live in Postgres (bytea, ≤ 5 MB) so they persist on Vercel (no writable disk) and are covered by DB backups.
+model Resume {
+  id            String     @id @default(cuid())
+  userId        String
+  user          User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jobId         String?
+  job           Job?       @relation(fields: [jobId], references: [id], onDelete: SetNull)
+  candidateId   String?
+  candidate     Candidate? @relation(fields: [candidateId], references: [id], onDelete: SetNull)
+  fileName      String
+  mimeType      String
+  sizeBytes     Int
+  /// SHA-256 of the file bytes → the same file uploaded twice is stored once per HR.
+  sha256        String
+  /// Cleaned text extracted at upload time (what the scorer reads; also powers search / "view as text" for DOCX).
+  extractedText String
+  /// Best-effort name read from the text, for the library list before any scoring.
+  guessedName   String?
+  data          Bytes
+  createdAt     DateTime   @default(now())
+
+  @@unique([userId, sha256])
+  @@index([userId, createdAt])
+  @@index([userId, jobId])
+  @@index([candidateId])
+}
+
+/// Score cache: (userId + jobId + candidateKey + rubricHash + kind) → the exact scored result.
+/// Unchanged candidates are never sent to the LLM again; editing the rubric changes rubricHash and naturally invalidates.
+model ScoreCache {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jobId        String
+  job          Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  /// "u:<normalized profile url>" or "t:<sha1 of normalized text>"
+  candidateKey String
+  rubricHash   String
+  /// Fingerprint of the candidate's text when scored. A different value under the same candidateKey = the candidate changed → re-score.
+  contentHash  String
+  /// "card" (search-result card) or "deep" (full profile / resume)
+  kind         String
+  score        Int
+  /// Full scored payload (ScoredCard for cards, Audit for deep) as returned to the client.
+  resultJson   Json
+  /// Denormalised for the "Analyzed only" list.
+  displayName  String?
+  profileUrl   String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  hits         SearchHit[]
+
+  @@unique([userId, jobId, candidateKey, rubricHash, kind])
+  @@index([userId, jobId, rubricHash, score])
+}
+
+/// One Naukri search (keywords + location + experience + salary + filters). Same search → same signature → same row,
+/// so "analyzed in this search" survives panel reloads and days later.
+model SearchSession {
+  id         String      @id @default(cuid())
+  userId     String
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jobId      String
+  job        Job         @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  signature  String
+  label      String
+  stateJson  Json
+  createdAt  DateTime    @default(now())
+  lastSeenAt DateTime    @default(now())
+  hits       SearchHit[]
+
+  @@unique([userId, jobId, signature])
+  @@index([userId, lastSeenAt])
+}
+
+model SearchHit {
+  searchSessionId String
+  searchSession   SearchSession @relation(fields: [searchSessionId], references: [id], onDelete: Cascade)
+  scoreCacheId    String
+  scoreCache      ScoreCache    @relation(fields: [scoreCacheId], references: [id], onDelete: Cascade)
+  seenAt          DateTime      @default(now())
+
+  @@id([searchSessionId, scoreCacheId])
+  @@index([scoreCacheId])
 }

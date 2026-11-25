@@ -1,20 +1,20 @@
 import { randomBytes } from "crypto";
-import { prisma } from "./prisma";
+import { redirect } from "next/navigation";
+import { getSessionUser, requireUser } from "./auth";
 
 export function generateApiKey() {
   return `rsx_${randomBytes(24).toString("hex")}`;
 }
 
 /**
- * Dashboard identity. This build is single-tenant: one recruiter, resolved from env.
- * Replace with a session lookup (NextAuth/Clerk) to make the dashboard multi-user —
- * the extension API already authenticates per-user via the Bearer extensionApiKey.
+ * The logged-in HR (session cookie). Multi-tenant: there is no shared/default user any more.
+ *  • API routes:   `getCurrentUser()` → throws HttpError(401) when logged out (turned into JSON by `handleDash`).
+ *  • Server pages: `getPageUser()`    → redirects to /login.
  */
-export async function getCurrentUser() {
-  const email = process.env.DEFAULT_USER_EMAIL ?? "recruiter@example.com";
-  return prisma.user.upsert({
-    where: { email },
-    update: {},
-    create: { email, name: process.env.DEFAULT_USER_NAME ?? "Recruiter", extensionApiKey: generateApiKey() },
-  });
+export const getCurrentUser = requireUser;
+
+export async function getPageUser() {
+  const u = await getSessionUser();
+  if (!u) redirect("/login");
+  return u;
 }

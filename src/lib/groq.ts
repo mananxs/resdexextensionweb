@@ -1,21 +1,18 @@
-import Groq from "groq-sdk";
 import type { ZodType, ZodTypeDef } from "zod";
 import { AuditJSON, AuditLLMZ, BatchJSON, BatchOutZ, RubricJSON, RubricZ, type Audit, type Rubric } from "./schemas";
 import { buildBooleanQuery, sanitizeBooleanQuery, MAX_BOOLEAN_CHARS } from "./resdexQuery";
 import { buildCriteria, computeScore, ctcString, fitOf, type Criterion, type Facts, type Worth } from "./scoring";
-import { tierFor } from "./tier";
+import { tierFor, noticeToDays } from "./tier";
+import { chatJson, defaultConcurrency, LlmError, mapWithConcurrency, MODELS, type Tier } from "./llmRouter";
+import { guardLevels } from "./evidenceGuard";
+import { prepareCardForLlm, prepareJdForLlm, prepareResumeForLlm } from "./textClean";
 
-export const MODELS = {
-  rubric: "openai/gpt-oss-120b", // deep requirement extraction + critic pass
-  batch: "openai/gpt-oss-20b", // ~1000 tok/s real-time scoring
-  deep: "openai/gpt-oss-120b", // single-profile audit
-} as const;
-
-let _client: Groq | null = null;
-function client(): Groq {
-  if (!process.env.GROQ_API_KEY) throw new Error("GROQ_API_KEY is not set on the server");
-  return (_client ??= new Groq({ apiKey: process.env.GROQ_API_KEY.trim(), maxRetries: 2 }));
-}
+/**
+ * Prompts + post-processing for the three LLM jobs (rubric extraction, batch card scoring, deep audit).
+ * Transport (keys, rotation, cooldowns, Groq⇄Gemini failover, JSON repair) lives in llmRouter.ts.
+ * The LLM never produces the final number: it extracts facts and rates evidence per criterion; scoring.ts does the maths.
+ */
+export { MODELS };
 
 /* ─────────────── Shared Indian-recruitment prompt rules ─────────────── */
 
@@ -35,12 +32,19 @@ COMPENSATION: LPA (lakhs per annum, INR). "12.5 Lacs" = 12.5 LPA; "1 Cr" = 100 L
 EXPERIENCE: total years (e.g. "6 Yrs 3 Months" = 6.25). LOCATION: Bengaluru = Bangalore; NCR includes Gurgaon/Gurugram/Noida/Delhi.
 Resdex text may be abbreviated, truncated or have masked contact info — report only what is present; never fabricate.
 Use -1 for unknown numbers and "" (or "Not mentioned") for unknown strings. Output must follow the supplied JSON schema exactly.
+
+ACCURACY RULES (these decide whether the recruiter trusts the result):
+- Evidence first: rate a criterion ONLY from what the candidate text actually says. A tool name in a skills list is weaker evidence than the same tool used in a described job or project.
+- Do not reward keyword stuffing: a long skills list with no experience/project backing is "partial" at best.
+- Do not penalise missing info that the format simply does not show (cards are short) — mark it unknown (-1 / "") rather than inventing a negative.
+- Experience: use stated total experience; if absent, derive it from the earliest start date to the latest end date/"Present" (ignore education and overlapping roles). Never count internships/training as full experience unless the JD does.
+- Be consistent: the same evidence must always produce the same level. When torn between two levels, choose the LOWER one and say why in the evidence field.
 `.trim();
 
-/* ─────────────── Structured-output call ─────────────── */
+/* ─────────────── Structured-output call (thin wrapper over the router) ─────────────── */
 
 interface StructuredArgs<T> {
-  model: string;
+  tier: Tier;
   name: string;
   system: string;
   user: string;
@@ -50,49 +54,11 @@ interface StructuredArgs<T> {
   effort: "low" | "medium" | "high";
 }
 
-const EFFORTS = ["low", "medium", "high"] as const;
+const structured = <T>(a: StructuredArgs<T>): Promise<T> => chatJson<T>(a);
 
-/** Groq's "json_validate_failed" (empty or truncated generation) — almost always the reasoning ate the token budget. */
+/** Truncated / empty / invalid generation (not a rate limit): worth splitting the batch and retrying. */
 function isJsonFailure(e: unknown) {
-  const err = e as { status?: number; message?: string };
-  return err.status === 400 && /json_validate_failed|Failed to (validate|generate) JSON/i.test(err.message ?? "");
-}
-
-async function structured<T>(a: StructuredArgs<T>): Promise<T> {
-  let lastErr: unknown;
-  let maxTokens = a.maxTokens;
-  let effort = a.effort;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const res = await client().chat.completions.create({
-        model: a.model,
-        temperature: 0.1,
-        max_completion_tokens: maxTokens,
-        reasoning_effort: effort,
-        messages: [
-          { role: "system", content: a.system },
-          { role: "user", content: a.user },
-        ],
-        response_format: { type: "json_schema", json_schema: { name: a.name, strict: true, schema: a.jsonSchema } },
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      } as any);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const content = (res as any).choices?.[0]?.message?.content as string | undefined;
-      if (!content) throw Object.assign(new Error("Empty response from Groq"), { retryable: true });
-      return a.zod.parse(JSON.parse(content));
-    } catch (e) {
-      lastErr = e;
-      const status = (e as { status?: number }).status;
-      if (isJsonFailure(e) || (e as { retryable?: boolean }).retryable || e instanceof SyntaxError) {
-        // Escalate: more room for the answer, less reasoning.
-        maxTokens = Math.min(16000, Math.round(maxTokens * 1.7));
-        effort = EFFORTS[Math.max(0, EFFORTS.indexOf(effort) - 1)];
-        continue;
-      }
-      if (status && status !== 429 && status < 500) break; // non-retryable (auth, bad request)
-    }
-  }
-  throw lastErr instanceof Error ? lastErr : new Error("Groq call failed");
+  return e instanceof LlmError ? e.kind === "json" : e instanceof SyntaxError;
 }
 
 /* ─────────────── 1. JD rubric extraction: extract → critique/refine (120B) ─────────────── */
@@ -128,11 +94,11 @@ Fields:
 Use -1 for any unstated number, "" for unstated strings, [] for unstated lists.`.trim();
 
 export async function extractRubric(rawJd: string): Promise<Rubric> {
-  const jd = rawJd.slice(0, 20000);
+  const jd = prepareJdForLlm(rawJd);
 
   // Pass 1 — thorough extraction
   const draft = await structured({
-    model: MODELS.rubric,
+    tier: "rubric",
     name: "jd_rubric",
     jsonSchema: RubricJSON,
     zod: RubricZ,
@@ -146,7 +112,7 @@ export async function extractRubric(rawJd: string): Promise<Rubric> {
   let final = draft;
   try {
     final = await structured({
-      model: MODELS.rubric,
+      tier: "rubric",
       name: "jd_rubric_refined",
       jsonSchema: RubricJSON,
       zod: RubricZ,
@@ -232,7 +198,8 @@ function normalizeRubric(r: Rubric): Rubric {
 function criteriaBlock(criteria: Criterion[]): string {
   return criteria.map((c) => `${c.id}. [${c.tier === "other" ? (c.kind === "dealbreaker" ? "DEAL-BREAKER" : "INFO") : c.tier.toUpperCase()}] ${c.ask}`).join("\n");
 }
-const LEVEL_RULES = `Level scale per criterion: 0 = no evidence / absent, 1 = partial, related or weaker than required, 2 = clear evidence. For DEAL-BREAKER rows: 2 = the candidate IS/HAS it, 0 = clearly not, 1 = unclear.`;
+const LEVEL_RULES_CARD = `Level scale per criterion: 2 = CLEAR — the skill/requirement appears in the card's skills, designation, headline or summary (on a short card, being listed counts); 1 = PARTIAL — related/adjacent technology, weaker seniority than required, or only hinted; 0 = ABSENT — nothing on the card supports it. When torn between two levels pick the LOWER one. For DEAL-BREAKER rows: 2 = the candidate clearly IS/HAS it, 0 = clearly not, 1 = unclear.`;
+const LEVEL_RULES_DEEP = `Level scale per criterion (strict, evidence-based): 2 = CLEAR — demonstrated in described work or projects (role, responsibility, outcome) or stated with explicit duration, and meets any years requirement; 1 = PARTIAL — merely listed without usage context, used briefly or long ago, adjacent/lower-level technology, or fewer years than required; 0 = ABSENT — no support in the text. When torn between two levels pick the LOWER one. For DEAL-BREAKER rows: 2 = the candidate clearly IS/HAS it (quote it in evidence), 0 = clearly not, 1 = unclear.`;
 
 const num = (n: number) => (Number.isFinite(n) ? n : -1);
 
@@ -264,25 +231,72 @@ export interface ScoredCard {
   ctc: string;
   oneLineVerdict: string;
   flags: string[];
+  /** How much evidence the card gave (unknown notice/CTC/experience or a very short card → lower). */
+  confidence?: "high" | "medium" | "low";
 }
 
+/** Facts the LLM left blank are recovered from the card text with plain regexes (Resdex prints "6 Yrs 3 Months", "Notice: 30 days"). */
+function recoverFacts(text: string, f: Facts, noticeText: string): Facts {
+  const out = { ...f };
+  if (out.expYears < 0 || out.expYears > 55) {
+    const m = text.match(/\b(\d{1,2})(?:\.(\d))?\s*\+?\s*(?:yrs?|years?)\b(?:[\s,]*(\d{1,2})\s*(?:months?|mos?)\b)?/i);
+    out.expYears = m ? Math.min(55, parseInt(m[1], 10) + (m[2] ? parseInt(m[2], 10) / 10 : 0) + (m[3] ? parseInt(m[3], 10) / 12 : 0)) : -1;
+    if (out.expYears >= 0) out.expYears = Math.round(out.expYears * 100) / 100;
+  }
+  if (out.noticeDays < 0) {
+    const fromField = noticeToDays(noticeText);
+    const m = text.match(/notice[^\n]{0,30}?(immediate|serving|\d+\s*(?:days?|weeks?|months?))/i);
+    const d = fromField ?? (m ? noticeToDays(m[1]) : null);
+    if (d !== null) out.noticeDays = d;
+  }
+  return out;
+}
+
+/** Batch size per LLM call. Smaller = fewer JSON failures and better spread across keys. */
+const CHUNK = Math.max(4, Number(process.env.LLM_BATCH_CHUNK) || 10);
+
 /**
- * Scores a batch; if the model can't produce valid JSON for it (too big / too much reasoning), the batch is
- * split in half and retried so one bad card can't sink the whole page. A single card that still fails is reported as `missing`.
+ * Scores cards. The list is split into chunks that run in parallel (bounded) across the key pool; a chunk the model can't
+ * return valid JSON for is split further, and a single card that still fails is reported as `missing` so the caller can retry it.
+ * If EVERY chunk is rate-limited the 429 is thrown (the caller reports "retry in Ns"); partial success returns what it has.
  */
 export async function scoreBatch(
   rubric: Rubric,
   cards: { domId: string; rawText: string }[],
 ): Promise<{ results: ScoredCard[]; missing: string[] }> {
+  const chunks: { domId: string; rawText: string }[][] = [];
+  for (let i = 0; i < cards.length; i += CHUNK) chunks.push(cards.slice(i, i + CHUNK));
+  const settled = await mapWithConcurrency(chunks, defaultConcurrency(), (c) => scoreChunk(rubric, c));
+
+  const results: ScoredCard[] = [];
+  const missing: string[] = [];
+  let rateErr: unknown = null;
+  let otherErr: unknown = null;
+  settled.forEach((r, i) => {
+    if (r.ok) {
+      results.push(...r.value.results);
+      missing.push(...r.value.missing);
+    } else {
+      missing.push(...chunks[i].map((c) => c.domId));
+      if (r.error instanceof LlmError && r.error.kind === "rate") rateErr ??= r.error;
+      else otherErr ??= r.error;
+    }
+  });
+  if (!results.length && cards.length) {
+    if (rateErr) throw rateErr;
+    if (otherErr) throw otherErr;
+  }
+  return { results, missing };
+}
+
+async function scoreChunk(rubric: Rubric, cards: { domId: string; rawText: string }[]): Promise<{ results: ScoredCard[]; missing: string[] }> {
   try {
     return await scoreBatchOnce(rubric, cards);
   } catch (e) {
-    const err = e as { status?: number };
-    const recoverable = isJsonFailure(e) || e instanceof SyntaxError || /Empty response|Zod|invalid/i.test((e as Error).message ?? "");
-    if (!recoverable || err.status === 429) throw e;
+    if (!isJsonFailure(e) && !/Zod|invalid/i.test((e as Error).message ?? "")) throw e;
     if (cards.length <= 1) return { results: [], missing: cards.map((c) => c.domId) };
     const mid = Math.ceil(cards.length / 2);
-    const [a, b] = [await scoreBatch(rubric, cards.slice(0, mid)), await scoreBatch(rubric, cards.slice(mid))];
+    const [a, b] = await Promise.all([scoreChunk(rubric, cards.slice(0, mid)), scoreChunk(rubric, cards.slice(mid))]);
     return { results: [...a.results, ...b.results], missing: [...a.missing, ...b.missing] };
   }
 }
@@ -293,10 +307,11 @@ async function scoreBatchOnce(
 ): Promise<{ results: ScoredCard[]; missing: string[] }> {
   const criteria = buildCriteria(rubric);
   const N = criteria.length;
-  const body = cards.map((c) => `<<<CARD domId="${c.domId}">>>\n${c.rawText.slice(0, 2500)}\n<<<END CARD>>>`).join("\n\n");
+  const prepared = new Map(cards.map((c) => [c.domId, prepareCardForLlm(c.rawText)]));
+  const body = cards.map((c) => `<<<CARD domId="${c.domId}">>>\n${prepared.get(c.domId)}\n<<<END CARD>>>`).join("\n\n");
 
   const out = await structured({
-    model: MODELS.batch,
+    tier: "batch",
     name: "batch_candidate_facts",
     jsonSchema: BatchJSON,
     zod: BatchOutZ,
@@ -307,7 +322,7 @@ async function scoreBatchOnce(
 TASK: For EVERY candidate card (echo its domId verbatim) do two things:
 A) Extract FACTS from EVERY visible field of the card — fullName, currentRole (current designation), currentCompany, headline (profile headline / one-line summary, ≤ 25 words, "" if none),
    skills (the key skills visibly listed, ≤ 12, as written), expYears, noticePeriod text + noticeDays, currentCtcLpa, expectedCtcLpa, location (-1 / "" if absent). Copy names/roles/companies verbatim; never guess.
-B) Rate each criterion below. "levels" must contain EXACTLY ${N} integers, in criterion order (index 0..${N - 1}). ${LEVEL_RULES}
+B) Rate each criterion below. "levels" must contain EXACTLY ${N} integers, in criterion order (index 0..${N - 1}). ${LEVEL_RULES_CARD}
 Cards are short snippets: judge from the skills list, designation, company, headline, summary, experience, CTC, notice period and location together — a skill only in a "preferred" list is weaker than one in the current designation or summary.
 Also give oneLineVerdict (≤ 18 words, name the strongest match and the biggest gap; do NOT state a numeric score).
 
@@ -323,14 +338,20 @@ ${criteriaBlock(criteria)}`,
     if (!wanted.has(r.domId) || seen.has(r.domId)) continue;
     if (r.levels.length !== N) continue; // malformed → reported as missing so the extension retries
     seen.add(r.domId);
-    const facts: Facts = {
-      expYears: num(r.expYears),
-      noticeDays: num(r.noticeDays),
-      currentCtcLpa: num(r.currentCtcLpa),
-      expectedCtcLpa: num(r.expectedCtcLpa),
-      location: r.location,
-    };
-    const s = computeScore(rubric, criteria, r.levels, facts, "card");
+    const text = prepared.get(r.domId) ?? "";
+    const facts = recoverFacts(
+      text,
+      {
+        expYears: num(r.expYears),
+        noticeDays: num(r.noticeDays),
+        currentCtcLpa: num(r.currentCtcLpa),
+        expectedCtcLpa: num(r.expectedCtcLpa),
+        location: r.location,
+      },
+      r.noticePeriod,
+    );
+    const guarded = guardLevels(rubric, criteria, r.levels, text);
+    const s = computeScore(rubric, criteria, guarded.levels, facts, "card", text.length);
     results.push({
       domId: r.domId,
       score: s.score,
@@ -355,6 +376,7 @@ ${criteriaBlock(criteria)}`,
       ctc: ctcString(facts),
       oneLineVerdict: r.oneLineVerdict,
       flags: s.flags.slice(0, 3),
+      confidence: s.breakdown.confidence,
     });
   }
   return { results, missing: cards.map((c) => c.domId).filter((id) => !seen.has(id)) };
@@ -364,19 +386,21 @@ ${criteriaBlock(criteria)}`,
 
 export async function auditProfile(rubric: Rubric, rawText: string): Promise<Audit & { tier: string }> {
   const criteria = buildCriteria(rubric);
+  const text = prepareResumeForLlm(rawText); // normalised + low-value sections dropped first, never a blind tail cut
   const llm = await structured({
-    model: MODELS.deep,
+    tier: "deep",
     name: "profile_audit",
     jsonSchema: AuditJSON,
     zod: AuditLLMZ,
-    maxTokens: 5000,
+    maxTokens: 5500,
     effort: "medium",
     system: `${INDIA_RULES}
 
-TASK: Audit ONE candidate profile against the criteria below.
+TASK: Audit ONE candidate profile / résumé against the criteria below. Be strict and evidence-based.
 - extracted: identity/contact facts verbatim from the text (fullName, currentRole, currentCompany, location, email, phone; "" when masked/absent); totalExpYears, currentCtcLpa, expectedCtcLpa (-1 if unknown); noticePeriod + noticeDays.
-- checks: one entry per criterion id (0..${criteria.length - 1}) with level and a SHORT evidence quote/paraphrase from the profile (≤ 14 words; "No evidence" if level 0). ${LEVEL_RULES}
-- strengths: 3–5 concrete, evidence-based bullets. risks: 2–4 bullets (job-hopping, gaps, stack staleness, seniority mismatch, counter-offer/relocation risks).
+- checks: one entry per criterion id (0..${criteria.length - 1}) with level and a SHORT evidence quote/paraphrase from the profile (≤ 14 words; "No evidence" if level 0). ${LEVEL_RULES_DEEP}
+- strengths: 3–5 concrete, evidence-based bullets (name the company/project/skill). risks: 2–4 bullets (job-hopping, gaps, stack staleness, seniority mismatch, counter-offer/relocation risks).
+- gaps: 0–5 concrete shortfalls vs. the criteria/limits (a missing must-have, years of experience below the minimum, an unverified claim). [] if none.
 - noticeNote / ctcNote / experienceNote: one sentence each vs. the JD limits (mention buy-out/negotiability for 60–90 day notice).
 - interviewQuestions: EXACTLY 3 tailored questions that probe the biggest gaps/partial must-haves and verify the strongest claims.
 - verdict: 2 sentences — screen/hire recommendation with reasoning (no numeric score).
@@ -385,7 +409,7 @@ JD CONTEXT: ${rubric.domainContext || rubric.title}; experience ${rubric.minExpe
 
 CRITERIA:
 ${criteriaBlock(criteria)}`,
-    user: `CANDIDATE PROFILE TEXT:\n"""\n${rawText.slice(0, 9000)}\n"""`,
+    user: `CANDIDATE PROFILE TEXT:\n"""\n${text}\n"""`,
   });
 
   const x = llm.extracted;
@@ -396,8 +420,15 @@ ${criteriaBlock(criteria)}`,
     expectedCtcLpa: num(x.expectedCtcLpa),
     location: x.location,
   };
-  const levels = criteria.map((c) => llm.checks.find((k) => k.id === c.id)?.level ?? 0);
-  const s = computeScore(rubric, criteria, levels, facts, "deep");
+  if (facts.noticeDays < 0) {
+    const d = noticeToDays(x.noticePeriod);
+    if (d !== null) facts.noticeDays = d;
+  }
+  const rawLevels = criteria.map((c) => llm.checks.find((k) => k.id === c.id)?.level ?? 0);
+  const evidence = criteria.map((c) => llm.checks.find((k) => k.id === c.id)?.evidence);
+  const guarded = guardLevels(rubric, criteria, rawLevels, text, evidence);
+  const levels = guarded.levels;
+  const s = computeScore(rubric, criteria, levels, facts, "deep", text.length);
 
   const checks = [
     ...criteria
@@ -410,7 +441,7 @@ ${criteriaBlock(criteria)}`,
       })),
     ...s.numeric.map((n) => ({ label: n.label, tier: "fit", level: n.credit >= 0.9 ? 2 : n.credit >= 0.5 ? 1 : 0, evidence: n.evidence })),
   ];
-  const contact = scrapeContact(rawText);
+  const contact = scrapeContact(rawText); // from the ORIGINAL text — trimming must never drop the contact block
 
   return {
     extracted: { ...x, email: x.email || contact.email, phone: x.phone || contact.phone },
@@ -420,6 +451,7 @@ ${criteriaBlock(criteria)}`,
     missingSkills: s.missing,
     strengths: llm.strengths,
     risks: llm.risks,
+    gaps: llm.gaps,
     noticeFit: fitOf(s.numeric.find((n) => n.key === "notice")),
     noticeNote: llm.noticeNote,
     ctcFit: fitOf(s.numeric.find((n) => n.key === "ctc")),
@@ -428,7 +460,8 @@ ${criteriaBlock(criteria)}`,
     interviewQuestions: llm.interviewQuestions.slice(0, 3),
     verdict: llm.verdict,
     checks,
-    flags: s.flags,
+    flags: [...s.flags, ...guarded.notes.map((n) => `Check: ${n}`)].slice(0, 8),
+    breakdown: s.breakdown,
   };
 }
 

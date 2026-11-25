@@ -1,7 +1,9 @@
 import Link from "next/link";
 import { prisma } from "@/lib/prisma";
 import { tierClasses } from "@/lib/tier";
-import { getCurrentUser } from "@/lib/user";
+import ResumeLibrary from "@/components/ResumeLibrary";
+import { listResumeDTOs } from "@/lib/resumes";
+import { getPageUser } from "@/lib/user";
 
 export const dynamic = "force-dynamic";
 
@@ -9,16 +11,17 @@ const STATUS_LABEL: Record<string, string> = { SHORTLISTED: "Shortlisted", CONTA
 
 export default async function CandidatesPage({ searchParams }: { searchParams: Promise<{ job?: string; all?: string }> }) {
   const sp = await searchParams;
-  const user = await getCurrentUser();
+  const user = await getPageUser();
   const showAll = sp.all === "1";
-  const [jobs, candidates] = await Promise.all([
+  const [jobs, candidates, resumes] = await Promise.all([
     prisma.job.findMany({ where: { userId: user.id }, orderBy: { createdAt: "desc" }, select: { id: true, title: true } }),
     prisma.candidate.findMany({
       where: { job: { userId: user.id }, ...(sp.job ? { jobId: sp.job } : {}), ...(showAll ? {} : { status: "SHORTLISTED" }) },
       omit: { resumeData: true }, // never pull file bytes into a list
-      include: { job: { select: { id: true, title: true } } },
+      include: { job: { select: { id: true, title: true } }, resumes: { orderBy: { createdAt: "desc" }, take: 1, select: { id: true, fileName: true, mimeType: true } } },
       orderBy: [{ aiScore: "desc" }, { createdAt: "desc" }],
     }),
+    listResumeDTOs({ userId: user.id, ...(sp.job ? { jobId: sp.job } : {}) }),
   ]);
   const qs = (o: { job?: string; all?: string }) => {
     const p = new URLSearchParams();
@@ -95,10 +98,17 @@ export default async function CandidatesPage({ searchParams }: { searchParams: P
                   </td>
                   <td className="px-3 py-2">{STATUS_LABEL[c.status]}</td>
                   <td className="px-3 py-2">
-                    {c.resumeName ? (
-                      <a href={`/api/candidates/${c.id}/resume`} download className="text-xs font-medium text-indigo-600 hover:underline" title={c.resumeName}>
-                        ⬇ Download
-                      </a>
+                    {c.resumes[0] || c.resumeName ? (
+                      <span className="flex flex-col gap-0.5 text-xs font-medium">
+                        {(c.resumes[0]?.mimeType ?? c.resumeMime) === "application/pdf" ? (
+                          <a href={c.resumes[0] ? `/api/resumes/${c.resumes[0].id}?inline=1` : `/api/candidates/${c.id}/resume?inline=1`} target="_blank" rel="noreferrer" className="text-indigo-600 hover:underline">
+                            View
+                          </a>
+                        ) : null}
+                        <a href={c.resumes[0] ? `/api/resumes/${c.resumes[0].id}` : `/api/candidates/${c.id}/resume`} download className="text-indigo-600 hover:underline" title={c.resumes[0]?.fileName ?? c.resumeName ?? ""}>
+                          ⬇ Download
+                        </a>
+                      </span>
                     ) : (
                       <span className="text-xs text-slate-400">{c.naukriProfileUrl ? <a href={c.naukriProfileUrl} target="_blank" rel="noreferrer" className="text-indigo-600 hover:underline">Resdex ↗</a> : "—"}</span>
                     )}
@@ -109,6 +119,10 @@ export default async function CandidatesPage({ searchParams }: { searchParams: P
           </table>
         </div>
       )}
+
+      <div className="mt-8">
+        <ResumeLibrary initial={resumes} jobs={jobs} />
+      </div>
     </div>
   );
 }

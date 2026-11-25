@@ -4,12 +4,12 @@ import NewJobModal from "@/components/NewJobModal";
 import { prisma } from "@/lib/prisma";
 import { RubricZ } from "@/lib/schemas";
 import { tierClasses } from "@/lib/tier";
-import { getCurrentUser } from "@/lib/user";
+import { getPageUser } from "@/lib/user";
 
 export const dynamic = "force-dynamic";
 
 export default async function JobsPage() {
-  const user = await getCurrentUser();
+  const user = await getPageUser();
   const jobs = await prisma.job.findMany({
     where: { userId: user.id },
     orderBy: { createdAt: "desc" },

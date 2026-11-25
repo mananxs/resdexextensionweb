@@ -24,6 +24,10 @@ function ScorePill({ score }: { score: number }) {
   return <span className={`rounded-full px-2 py-0.5 text-xs font-bold ring-1 ring-inset ${tierClasses(score)}`}>{score}%</span>;
 }
 
+function StaleBadge() {
+  return <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-amber-800" title="The job's rubric changed after this candidate was scored — re-run the audit to refresh the score">Rubric changed</span>;
+}
+
 function CardOnlyBadge() {
   return <span className="rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600" title="Saved from a search card — profile not opened yet, no contact details">Card only</span>;
 }
@@ -35,12 +39,14 @@ export default function CandidateBoard({ jobId, candidates: initial }: { jobId: 
   const [minScore, setMinScore] = useState(0);
   const [maxNotice, setMaxNotice] = useState(0); // 0 = any
   const [q, setQ] = useState("");
+  const [level, setLevel] = useState<"all" | "full" | "card">("all"); // "Analyzed only" = deep audit / résumé scored
   const [openId, setOpenId] = useState<string | null>(null);
 
   const filtered = useMemo(
     () =>
       items
         .filter((c) => c.aiScore >= minScore)
+        .filter((c) => level === "all" || c.profileLevel === level)
         .filter((c) => {
           if (!maxNotice) return true;
           const d = noticeToDays(c.noticePeriod);
@@ -48,9 +54,15 @@ export default function CandidateBoard({ jobId, candidates: initial }: { jobId: 
         })
         .filter((c) => !q || `${c.fullName} ${c.currentRole} ${c.currentCompany} ${c.matchedSkills.join(" ")}`.toLowerCase().includes(q.toLowerCase()))
         .sort((a, b) => b.aiScore - a.aiScore),
-    [items, minScore, maxNotice, q],
+    [items, minScore, maxNotice, q, level],
   );
   const open = items.find((c) => c.id === openId) ?? null;
+  const [textView, setTextView] = useState<{ title: string; text: string } | null>(null);
+  async function showText(url: string, title: string) {
+    const res = await fetch(url);
+    const body = await res.json().catch(() => ({}));
+    setTextView({ title, text: res.ok ? body.text || "(No text could be extracted — download the file instead.)" : body.error ?? "Failed to load" });
+  }
 
   async function setStatus(id: string, status: CandidateDTO["status"]) {
     const prev = items;
@@ -74,6 +86,7 @@ export default function CandidateBoard({ jobId, candidates: initial }: { jobId: 
           <div className="flex shrink-0 flex-col items-end gap-1">
             <ScorePill score={c.aiScore} />
             {c.profileLevel === "card" && <CardOnlyBadge />}
+            {c.stale && <StaleBadge />}
           </div>
         </div>
         <div className="mt-2 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-slate-500">
@@ -91,6 +104,11 @@ export default function CandidateBoard({ jobId, candidates: initial }: { jobId: 
       <ResumeUploader jobId={jobId} onCandidate={upsertItem} />
       <div className="mb-4 flex flex-wrap items-center gap-3">
         <input className="input max-w-xs" placeholder="Search name, role, skill…" value={q} onChange={(e) => setQ(e.target.value)} />
+        <select className="input w-auto" value={level} onChange={(e) => setLevel(e.target.value as typeof level)} title="Full = deep audit or résumé scored · Card = scored from a search card only">
+          <option value="all">All candidates</option>
+          <option value="full">Analyzed only (full audit)</option>
+          <option value="card">Card-level only</option>
+        </select>
         <select className="input w-auto" value={minScore} onChange={(e) => setMinScore(+e.target.value)}>
           <option value={0}>Any score</option>
           <option value={60}>60%+ (Good fit)</option>
@@ -172,6 +190,18 @@ export default function CandidateBoard({ jobId, candidates: initial }: { jobId: 
         </div>
       )}
 
+      {textView && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/50 p-4" onClick={() => setTextView(null)}>
+          <div className="max-h-[85vh] w-full max-w-2xl overflow-hidden rounded-xl bg-white shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between border-b border-slate-200 px-4 py-2">
+              <b className="truncate text-sm">{textView.title}</b>
+              <button onClick={() => setTextView(null)} aria-label="Close" className="text-slate-500 hover:text-slate-900">✕</button>
+            </div>
+            <pre className="max-h-[75vh] overflow-auto whitespace-pre-wrap p-4 font-sans text-xs leading-relaxed text-slate-800">{textView.text}</pre>
+          </div>
+        </div>
+      )}
+
       {open && (
         <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/40 backdrop-blur-[2px] animate-fade" onClick={() => setOpenId(null)}>
           <aside className="h-full w-full max-w-lg overflow-y-auto bg-white p-6 shadow-2xl animate-slide" onClick={(e) => e.stopPropagation()}>
@@ -189,6 +219,7 @@ export default function CandidateBoard({ jobId, candidates: initial }: { jobId: 
               <span className={`rounded-full px-3 py-1 text-lg font-bold ring-1 ring-inset ${tierClasses(open.aiScore)}`}>{open.aiScore}%</span>
               <span className="text-sm font-medium text-slate-700">{open.aiTier}</span>
               {open.profileLevel === "card" && <CardOnlyBadge />}
+              {open.stale && <StaleBadge />}
               <select className="input ml-auto w-auto" value={open.status} onChange={(e) => setStatus(open.id, e.target.value as CandidateDTO["status"])}>
                 {STATUSES.map((s) => (
                   <option key={s} value={s}>
@@ -224,6 +255,32 @@ export default function CandidateBoard({ jobId, candidates: initial }: { jobId: 
                   <div key={f} className="rounded bg-rose-50 px-2 py-1 text-xs font-medium text-rose-700">⚠ {f}</div>
                 ))}
               </div>
+            ) : null}
+            {open.audit?.breakdown ? (
+              <Section title="Why this score">
+                <div className="rounded-lg border border-slate-200 p-3 text-xs text-slate-700">
+                  <div className="flex flex-wrap gap-x-4 gap-y-1">
+                    <span>Must-haves: <b>{open.audit.breakdown.coverage.must ?? "—"}{open.audit.breakdown.coverage.must !== null ? "%" : ""}</b></span>
+                    <span>Important: <b>{open.audit.breakdown.coverage.important ?? "—"}{open.audit.breakdown.coverage.important !== null ? "%" : ""}</b></span>
+                    <span>Nice-to-have: <b>{open.audit.breakdown.coverage.nice ?? "—"}{open.audit.breakdown.coverage.nice !== null ? "%" : ""}</b></span>
+                    <span>Evidence confidence: <b className="capitalize">{open.audit.breakdown.confidence}</b></span>
+                  </div>
+                  {open.audit.breakdown.gates.length > 0 ? (
+                    <ul className="mt-1.5 list-disc pl-4 text-amber-800">
+                      {open.audit.breakdown.gates.map((g) => (
+                        <li key={g}>{g}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="mt-1.5 text-slate-500">No caps applied — weighted score {open.audit.breakdown.rawScore}%.</p>
+                  )}
+                </div>
+              </Section>
+            ) : null}
+            {open.audit?.gaps?.length ? (
+              <Section title="Gaps vs. the rubric">
+                <List items={open.audit.gaps} />
+              </Section>
             ) : null}
             {open.audit?.checks?.length ? (
               <Section title="Requirement checklist">
@@ -275,10 +332,23 @@ export default function CandidateBoard({ jobId, candidates: initial }: { jobId: 
               )
             )}
 
-            {open.resumeName && (
-              <a href={`/api/candidates/${open.id}/resume`} className="btn-ghost mt-6 w-full" download>
-                Download resume · {open.resumeName}
-              </a>
+            {open.resume && (
+              <div className="mt-6 flex gap-2">
+                {open.resume.isPdf ? (
+                  <a href={open.resume.viewUrl} target="_blank" rel="noreferrer" className="btn-ghost flex-1">
+                    View resume
+                  </a>
+                ) : (
+                  open.resume.textUrl && (
+                    <button className="btn-ghost flex-1" onClick={() => void showText(open.resume!.textUrl!, open.resume!.fileName)}>
+                      View as text
+                    </button>
+                  )
+                )}
+                <a href={open.resume.downloadUrl} className="btn-ghost flex-1" download title={open.resume.fileName}>
+                  Download
+                </a>
+              </div>
             )}
             {open.naukriProfileUrl && (
               <a href={open.naukriProfileUrl} target="_blank" rel="noreferrer" className="btn-primary mt-6 w-full">

@@ -173,6 +173,19 @@ export function numericFits(r: Rubric, f: Facts): NumFit[] {
 /** Quota recommendation for ONE paid CV view: open = High Priority · review = Borderline (judge the card first) · skip = Save Quota. */
 export type Worth = "open" | "review" | "skip";
 
+/** Transparent "why this number": every weighted component, the coverage per tier, and any cap that was applied. */
+export interface ScoreBreakdown {
+  /** Weighted average BEFORE the gates, 0–100. */
+  rawScore: number;
+  /** Caps applied after the weighted average (e.g. "Must-have coverage 40% → capped at 55"). */
+  gates: string[];
+  /** Weighted coverage (0–100) per skill tier; null when the rubric has no skills in that tier. */
+  coverage: { must: number | null; important: number | null; nice: number | null };
+  components: { label: string; tier: string; weight: number; credit: number; known: boolean }[];
+  /** How much hard evidence the score rests on: unknown numeric fields / a very short text lower it. */
+  confidence: "high" | "medium" | "low";
+}
+
 export interface ScoreResult {
   score: number;
   matched: string[];
@@ -181,6 +194,7 @@ export interface ScoreResult {
   numeric: NumFit[];
   worth: Worth;
   worthReasons: string[];
+  breakdown: ScoreBreakdown;
 }
 
 const lvl = (n: number) => (n >= 2 ? 2 : n >= 1 ? 1 : 0);
@@ -189,10 +203,12 @@ const lvl = (n: number) => (n >= 2 ? 2 : n >= 1 ? 1 : 0);
  * mode "card": Resdex cards are truncated snippets, so "no evidence" is weak evidence of absence → small residual credit and softer gates.
  * mode "deep": full profile → absence counts fully.
  */
-export function computeScore(r: Rubric, criteria: Criterion[], levels: number[], facts: Facts, mode: "card" | "deep"): ScoreResult {
+export function computeScore(r: Rubric, criteria: Criterion[], levels: number[], facts: Facts, mode: "card" | "deep", textLength = 0): ScoreResult {
   const zero = mode === "card" ? 0.15 : 0;
   let num = 0;
   let den = 0;
+  const components: ScoreBreakdown["components"] = [];
+  const tierSum: Record<string, { n: number; d: number }> = { must: { n: 0, d: 0 }, important: { n: 0, d: 0 }, nice: { n: 0, d: 0 } };
   let mustNum = 0;
   let mustDen = 0;
   const matched: string[] = [];
@@ -214,6 +230,11 @@ export function computeScore(r: Rubric, criteria: Criterion[], levels: number[],
     const credit = l === 2 ? 1 : l === 1 ? 0.5 : zero;
     num += c.weight * credit;
     den += c.weight;
+    components.push({ label: c.name, tier: c.tier, weight: c.weight, credit, known: true });
+    if (tierSum[c.tier]) {
+      tierSum[c.tier].n += c.weight * credit;
+      tierSum[c.tier].d += c.weight;
+    }
     if (c.tier === "must") {
       mustNum += c.weight * credit;
       mustDen += c.weight;
@@ -231,6 +252,7 @@ export function computeScore(r: Rubric, criteria: Criterion[], levels: number[],
   for (const n of numeric) {
     num += n.weight * n.credit;
     den += n.weight;
+    components.push({ label: n.label, tier: "fit", weight: n.weight, credit: n.credit, known: n.known });
     if (n.known && n.credit <= 0.35) {
       flags.push(
         n.key === "experience" ? `Experience ${facts.expYears} yrs vs ${n.label.replace("Experience ", "")}` :
@@ -242,28 +264,48 @@ export function computeScore(r: Rubric, criteria: Criterion[], levels: number[],
   }
 
   let score = den > 0 ? (100 * num) / den : 0;
+  const rawScore = Math.round(score);
+  const gates: string[] = [];
+  const cap = (limit: number, why: string) => {
+    if (score > limit) {
+      score = limit;
+      gates.push(`${why} → capped at ${limit}`);
+    }
+  };
 
   // Gates — a candidate missing the core requirements can't look "good" just because the soft factors are great.
   const cov = mustDen > 0 ? mustNum / mustDen : 1;
+  const covPct = Math.round(cov * 100);
   if (mode === "deep") {
-    if (cov < 0.25) score = Math.min(score, 35);
-    else if (cov < 0.5) score = Math.min(score, 55);
+    if (cov < 0.25) cap(35, `Must-have coverage ${covPct}%`);
+    else if (cov < 0.5) cap(55, `Must-have coverage ${covPct}%`);
   } else {
-    if (cov < 0.3) score = Math.min(score, 42);
-    else if (cov < 0.55) score = Math.min(score, 58);
+    if (cov < 0.3) cap(42, `Must-have coverage ${covPct}%`);
+    else if (cov < 0.55) cap(58, `Must-have coverage ${covPct}%`);
   }
   const exp = numeric.find((n) => n.key === "experience");
-  if (exp && exp.known && exp.credit <= 0.1) score = Math.min(score, 55); // far below the minimum
-  else if (exp && exp.known && exp.credit <= 0.35) score = Math.min(score, 75); // >2 yrs under, or >4 yrs over the range
+  if (exp && exp.known && exp.credit <= 0.1) cap(55, "Experience far below the minimum"); // far below the minimum
+  else if (exp && exp.known && exp.credit <= 0.35) cap(75, "Experience well outside the range"); // >2 yrs under, or >4 yrs over the range
   const ctc = numeric.find((n) => n.key === "ctc");
-  if (ctc && ctc.known && ctc.credit <= 0.1) score = Math.min(score, 65); // >25% over budget
+  if (ctc && ctc.known && ctc.credit <= 0.1) cap(65, "CTC >25% over budget");
   const notice = numeric.find((n) => n.key === "notice");
-  if (notice && notice.known && notice.credit <= 0.1) score = Math.min(score, 70); // 30+ days beyond the limit
-  if (dealBreaker) score = Math.min(score, 30);
+  if (notice && notice.known && notice.credit <= 0.1) cap(70, "Notice 30+ days beyond the limit");
+  if (dealBreaker) cap(30, "Deal-breaker present");
 
   const finalScore = Math.max(0, Math.min(100, Math.round(score)));
   const { worth, reasons } = decideWorth(r, numeric, { score: finalScore, cov, mustAbsent, mustPartial, dealBreaker, flags, facts });
-  return { score: finalScore, matched, missing, flags, numeric, worth, worthReasons: reasons };
+  const unknownNumeric = numeric.filter((n) => !n.known).length;
+  const confidence: ScoreBreakdown["confidence"] =
+    (mode === "card" && textLength > 0 && textLength < 350) || unknownNumeric >= 3 ? "low" : unknownNumeric >= 2 || (mode === "deep" && textLength > 0 && textLength < 900) ? "medium" : "high";
+  const pct = (t: { n: number; d: number }) => (t.d > 0 ? Math.round((100 * t.n) / t.d) : null);
+  const breakdown: ScoreBreakdown = {
+    rawScore,
+    gates,
+    coverage: { must: pct(tierSum.must), important: pct(tierSum.important), nice: pct(tierSum.nice) },
+    components,
+    confidence,
+  };
+  return { score: finalScore, matched, missing, flags, numeric, worth, worthReasons: reasons, breakdown };
 }
 
 interface WorthInput {

@@ -1,18 +1,18 @@
 import ApiKeyPanel from "@/components/ApiKeyPanel";
-import { getCurrentUser } from "@/lib/user";
+import { getPageUser } from "@/lib/user";
 
 export const dynamic = "force-dynamic";
 
 const STEPS = [
   "Build the extension (cd extension && npm install && npm run build) and open chrome://extensions → enable Developer mode → Load unpacked → select extension/dist.",
   "Log in to resdex.naukri.com in Chrome, then click the Co-Pilot toolbar icon to open the Side Panel.",
-  "Paste the Platform URL and Extension API key from this page and click Connect (grant the host-access prompt).",
+  "In the side panel, log in with the SAME email and password you use here (grant the host-access prompt). Pasting the Platform URL + key below also works. Each HR gets their own isolated workspace.",
   "Pick an active job (or paste an ad-hoc JD). Optionally click “Auto-Fill Resdex Search” — then run a simple keyword search on Resdex yourself.",
   "Candidate cards get match badges automatically; open a candidate profile to see the deep audit and click “Save & Shortlist to Platform”.",
 ];
 
 export default async function ExtensionSetupPage() {
-  const user = await getCurrentUser();
+  const user = await getPageUser();
   return (
     <div className="mx-auto max-w-3xl space-y-6">
       <div>

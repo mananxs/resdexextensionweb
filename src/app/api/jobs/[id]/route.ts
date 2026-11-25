@@ -1,17 +1,21 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { buildBooleanQuery, sanitizeBooleanQuery } from "@/lib/resdexQuery";
+import { HttpError } from "@/lib/errors";
+import { handleDash } from "@/lib/http";
+import { rubricHash } from "@/lib/keys";
 import { prisma } from "@/lib/prisma";
+import { buildBooleanQuery, sanitizeBooleanQuery } from "@/lib/resdexQuery";
 import { RubricZ } from "@/lib/schemas";
-import { getCurrentUser } from "@/lib/user";
 
 export const dynamic = "force-dynamic";
 
-export async function DELETE(_req: Request, ctx: { params: Promise<{ id: string }> }) {
-  const { id } = await ctx.params;
-  const user = await getCurrentUser();
-  const res = await prisma.job.deleteMany({ where: { id, userId: user.id } });
-  return res.count ? NextResponse.json({ ok: true }) : NextResponse.json({ error: "Not found" }, { status: 404 });
+export function DELETE(req: Request, ctx: { params: Promise<{ id: string }> }) {
+  return handleDash(req, async (user) => {
+    const { id } = await ctx.params;
+    const res = await prisma.job.deleteMany({ where: { id, userId: user.id } });
+    if (!res.count) throw new HttpError(404, "Not found");
+    return NextResponse.json({ ok: true });
+  });
 }
 
 const PatchBody = z.object({
@@ -23,14 +27,13 @@ const PatchBody = z.object({
   rubric: RubricZ.optional(),
 });
 
-/** Edit a job after creation: details, status and the full rubric (no new Groq call). */
-export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }> }) {
-  try {
+/** Edit a job after creation: details, status and the full rubric (no new LLM call). A changed rubric changes rubricHash → old cached scores stop matching. */
+export function PATCH(req: Request, ctx: { params: Promise<{ id: string }> }) {
+  return handleDash(req, async (user) => {
     const { id } = await ctx.params;
-    const user = await getCurrentUser();
     const b = PatchBody.parse(await req.json().catch(() => ({})));
     const existing = await prisma.job.findFirst({ where: { id, userId: user.id }, select: { id: true } });
-    if (!existing) return NextResponse.json({ error: "Not found" }, { status: 404 });
+    if (!existing) throw new HttpError(404, "Not found");
 
     let rubric = b.rubric;
     if (rubric) {
@@ -46,12 +49,9 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
         ...(b.location !== undefined && { location: b.location || null }),
         ...(b.status !== undefined && { status: b.status }),
         ...(b.rawDescription !== undefined && { rawDescription: b.rawDescription }),
-        ...(rubric && { parsedRubricJson: rubric }),
+        ...(rubric && { parsedRubricJson: rubric, rubricHash: rubricHash(rubric) }),
       },
     });
     return NextResponse.json({ job: { id: job.id } });
-  } catch (e) {
-    if (e instanceof z.ZodError) return NextResponse.json({ error: e.issues[0]?.message ?? "Invalid input" }, { status: 400 });
-    return NextResponse.json({ error: e instanceof Error ? e.message : "Update failed" }, { status: 500 });
-  }
+  });
 }

@@ -180,6 +180,8 @@ export const AuditLLMZ = z.object({
   checks: z.array(z.object({ id: z.number(), level: z.number(), evidence: z.string() })),
   strengths: z.array(z.string()),
   risks: z.array(z.string()),
+  /** Concrete gaps vs. the rubric (missing must-haves, short experience, unverified claims). */
+  gaps: z.array(z.string()).default([]),
   noticeNote: z.string(),
   ctcNote: z.string(),
   experienceNote: z.string(),
@@ -204,6 +206,7 @@ export const AuditJSON = obj({
   checks: arr(obj({ id: int, level: int, evidence: str })),
   strengths: arr(str),
   risks: arr(str),
+  gaps: arr(str),
   noticeNote: str,
   ctcNote: str,
   experienceNote: str,
@@ -235,6 +238,17 @@ export const AuditZ = z.object({
   verdict: z.string(),
   checks: z.array(CheckZ).default([]),
   flags: z.array(z.string()).default([]),
+  gaps: z.array(z.string()).default([]),
+  /** Server-computed "why this score" (components, coverage, caps, confidence). Passed through untouched. */
+  breakdown: z
+    .object({
+      rawScore: z.number(),
+      gates: z.array(z.string()),
+      coverage: z.object({ must: z.number().nullable(), important: z.number().nullable(), nice: z.number().nullable() }),
+      components: z.array(z.object({ label: z.string(), tier: z.string(), weight: z.number(), credit: z.number(), known: z.boolean() })),
+      confidence: z.enum(["high", "medium", "low"]),
+    })
+    .optional(),
 });
 export type Audit = z.infer<typeof AuditZ>;
 
@@ -251,15 +265,45 @@ export const CreateJobBody = z.object({
 export const ScoreBatchBody = z.object({
   jobId: z.string().min(1),
   candidates: z
-    .array(z.object({ domId: z.string().min(1).max(64), rawText: z.string().max(10000) }))
+    .array(z.object({ domId: z.string().min(1).max(64), rawText: z.string().max(10000), profileUrl: z.string().max(2000).optional() }))
     .min(1)
-    .max(20),
+    .max(40),
+  /** The Naukri search these cards were found in (POST /search-session). Analyzed cards are linked to it. */
+  searchSessionId: z.string().max(64).optional(),
+  /** true → "Analyzed only": return cached scores, make NO LLM call; uncached cards come back in `unscored`. */
+  onlyCached: z.boolean().optional(),
+  /** true → ignore the cache and re-score (explicit "Re-score" action). */
+  force: z.boolean().optional(),
 });
 
 export const ScoreProfileBody = z.object({
   jobId: z.string().min(1),
   rawText: z.string().min(30).max(20000),
   profileUrl: z.string().max(2000).optional(),
+  force: z.boolean().optional(),
+});
+
+/** One Naukri search: everything the recruiter can set on the Resdex page. */
+export const SearchStateZ = z.object({
+  keywords: z.string().max(2000).default(""),
+  anyKeywords: z.array(z.string().max(200)).max(40).default([]),
+  excludeKeywords: z.array(z.string().max(200)).max(40).default([]),
+  location: z.string().max(500).default(""),
+  minExp: z.number().nullable().default(null),
+  maxExp: z.number().nullable().default(null),
+  minSalary: z.number().nullable().default(null),
+  maxSalary: z.number().nullable().default(null),
+  /** Everything else from the filter panels, e.g. { label: "Notice period", value: "15 days or less" }. */
+  filters: z.array(z.object({ label: z.string().max(120), value: z.string().max(300) })).max(80).default([]),
+  url: z.string().max(2000).default(""),
+  page: z.number().int().nullable().default(null),
+});
+export type SearchState = z.infer<typeof SearchStateZ>;
+
+export const SearchSessionBody = z.object({
+  jobId: z.string().min(1).optional(),
+  signature: z.string().min(1).max(64),
+  state: SearchStateZ,
 });
 
 /** Facts + score read off a Resdex SEARCH-RESULT CARD (no profile opened → no CV-view quota spent, no email/phone). */

@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import { extractRubric } from "@/lib/groq";
-import { authenticate, handle, json, preflight } from "@/lib/http";
+import { handleExt, json, preflight } from "@/lib/http";
+import { rubricHash } from "@/lib/keys";
 import { prisma } from "@/lib/prisma";
 import { CreateJobBody, RubricZ } from "@/lib/schemas";
 
@@ -10,9 +11,9 @@ export const maxDuration = 60;
 
 export const OPTIONS = preflight;
 
+/** Only THIS HR's jobs (userId filter) — another HR's jobs/rubrics are never visible here. */
 export function GET(req: NextRequest) {
-  return handle(async () => {
-    const user = await authenticate(req);
+  return handleExt(req, async (user) => {
     const jobs = await prisma.job.findMany({
       where: { userId: user.id, status: "ACTIVE" },
       orderBy: { createdAt: "desc" },
@@ -32,10 +33,9 @@ export function GET(req: NextRequest) {
   });
 }
 
-/** Creates a job from a pasted/ad-hoc JD; the Groq rubric is parsed once and cached in parsedRubricJson. */
+/** Creates a job from a pasted/ad-hoc JD; the rubric is parsed once and cached in parsedRubricJson. */
 export function POST(req: NextRequest) {
-  return handle(async () => {
-    const user = await authenticate(req);
+  return handleExt(req, async (user) => {
     const body = CreateJobBody.parse(await req.json());
     const rubric = body.rubric ?? (await extractRubric(body.rawDescription));
     const job = await prisma.job.create({
@@ -46,11 +46,9 @@ export function POST(req: NextRequest) {
         location: body.location || rubric.locations[0] || null,
         rawDescription: body.rawDescription,
         parsedRubricJson: rubric,
+        rubricHash: rubricHash(rubric),
       },
     });
-    return json(
-      { job: { id: job.id, title: job.title, department: job.department, location: job.location, status: job.status, candidateCount: 0, rubric } },
-      201,
-    );
+    return json({ job: { id: job.id, title: job.title, department: job.department, location: job.location, status: job.status, candidateCount: 0, rubric } }, 201);
   });
 }
